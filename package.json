@@ -1,0 +1,53 @@
+{
+  "name": "claude-for-zen",
+  "version": "1.0.0",
+  "description": "Let Claude Code drive Zen Browser (and other Firefox-based browsers) the way Claude in Chrome drives Chrome — an MCP server built on WebDriver BiDi.",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "claude-for-zen": "bin/claude-for-zen.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/claude-for-zen.js serve",
+    "test": "node --test test/unit/*.test.js",
+    "test:e2e": "node --test --test-concurrency=1 --test-timeout=600000 test/e2e/*.test.js",
+    "test:all": "npm test && npm run test:e2e",
+    "doctor": "node bin/claude-for-zen.js doctor"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "mcp",
+    "zen-browser",
+    "firefox",
+    "webdriver-bidi",
+    "browser-automation"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ilhamnadhif/claude-for-zen.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ilhamnadhif/claude-for-zen/issues"
+  },
+  "homepage": "https://github.com/ilhamnadhif/claude-for-zen#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "acorn": "^8.19.0",
+    "gifenc": "^1.0.3",
+    "jpeg-js": "^0.4.4",
+    "pngjs": "^7.0.0",
+    "ws": "^8.22.2",
+    "zod": "^4.6.7"
+  }
+}

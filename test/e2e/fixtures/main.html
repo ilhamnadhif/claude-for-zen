@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CFZ Test Page</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 12px; }
+  .box { width: 160px; height: 36px; margin: 4px 0; background: #eee; display: flex; align-items: center; justify-content: center; user-select: none; }
+  #drag-area { width: 320px; height: 70px; background: #def; }
+  #spacer { height: 2600px; background: linear-gradient(#fff, #ccc); }
+  #editor { min-height: 30px; border: 1px solid #999; }
+  iframe { border: 1px solid #888; }
+</style>
+</head>
+<body>
+<h1>CFZ Test Page</h1>
+<nav aria-label="Main">
+  <a href="/main.html?x=1">Home</a>
+  <a href="/popup.html" target="_blank" id="popup-link">Open popup</a>
+</nav>
+<main>
+  <button id="btn">Click me</button> <span id="count">0</span>
+  <div id="dbl" class="box">Double click here</div>
+  <div id="ctx" class="box">Right click here</div>
+  <div id="hover-target" class="box">Hover me</div>
+  <div id="drag-area">Drag area</div>
+  <form id="form">
+    <label for="q">Search query</label> <input id="q" name="q" placeholder="Type here">
+    <label>Notes <textarea id="notes"></textarea></label>
+    <label for="color">Favorite color</label>
+    <select id="color"><option value="r">Red</option><option value="g">Green</option><option value="b">Blue</option></select>
+    <label><input type="checkbox" id="agree"> I agree</label>
+    <input type="password" id="pw" aria-label="Password">
+    <input type="file" id="file" aria-label="Upload file">
+    <button type="submit">Search</button>
+  </form>
+  <div id="result"></div>
+  <div id="editor" contenteditable="true" aria-label="Rich editor"></div>
+  <input id="tracked" aria-label="Tracked input">
+  <div role="button" tabindex="0" id="custom-btn">Custom role button</div>
+  <div id="pointer-div" style="cursor:pointer">Pointer div clickable</div>
+  <button id="log-btn">Log stuff</button>
+  <button id="fetch-btn">Fetch data</button>
+  <button id="alert-btn" onclick="alert('Hello alert')">Alert</button>
+  <button id="confirm-btn" onclick="window.__confirm = confirm('Are you sure?')">Confirm</button>
+  <button id="prompt-btn" onclick="window.__prompt = prompt('Your name?', 'anon')">Prompt</button>
+  <button id="hidden-btn" style="display:none">Hidden button</button>
+  <div>
+    <iframe id="same-frame" title="Same origin frame" src="/frame.html" width="380" height="90"></iframe>
+    <iframe id="cross-frame" title="Cross origin frame" width="380" height="90"></iframe>
+  </div>
+  <div id="spacer"></div>
+  <button id="bottom-btn">Bottom button</button>
+  <p id="article-text">The quick brown fox jumps over the lazy dog.</p>
+</main>
+<script>
+  window.__events = [];
+  window.__frameMsgs = [];
+  const rec = (e) => window.__events.push({
+    type: e.type, id: e.target && e.target.id, trusted: e.isTrusted, x: e.clientX, y: e.clientY,
+    button: e.button, detail: e.detail, ctrl: e.ctrlKey, shift: e.shiftKey, meta: e.metaKey, alt: e.altKey, key: e.key,
+  });
+  for (const t of ["click", "dblclick", "contextmenu", "mouseover", "mousedown", "mouseup", "wheel"]) document.addEventListener(t, rec, true);
+  document.getElementById("drag-area").addEventListener("mousemove", rec);
+  document.getElementById("btn").addEventListener("click", () => {
+    const c = document.getElementById("count");
+    c.textContent = String(Number(c.textContent) + 1);
+  });
+  document.getElementById("ctx").addEventListener("contextmenu", (e) => e.preventDefault());
+  document.getElementById("form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    document.getElementById("result").textContent = "submitted:" + new FormData(e.target).get("q");
+  });
+  document.getElementById("log-btn").addEventListener("click", () => {
+    console.log("hello-log from page");
+    console.warn("careful-warning");
+    console.error("bad-thing happened");
+    setTimeout(() => { throw new Error("boom-uncaught"); }, 0);
+  });
+  document.getElementById("fetch-btn").addEventListener("click", async () => {
+    const r = await fetch("/api/data?token=secret123&page=2");
+    window.__fetched = await r.json();
+  });
+  window.addEventListener("message", (e) => window.__frameMsgs.push(e.data));
+  // A cross-origin frame: swap 127.0.0.1 <-> localhost.
+  const other = location.hostname === "127.0.0.1" ? "localhost" : "127.0.0.1";
+  document.getElementById("cross-frame").src = location.protocol + "//" + other + ":" + location.port + "/frame.html";
+  // Simulate React's value tracker: an own "value" property on the element.
+  (function () {
+    const el = document.getElementById("tracked");
+    const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+    let tracker = "";
+    Object.defineProperty(el, "value", {
+      configurable: true,
+      get() { return desc.get.call(this); },
+      set(v) { tracker = String(v); desc.set.call(this, v); },
+    });
+    el.addEventListener("input", () => {
+      const cur = desc.get.call(el);
+      window.__trackedChanged = cur !== tracker;
+      tracker = cur;
+    });
+  })();
+</script>
+</body>
+</html>
