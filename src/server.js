@@ -26,6 +26,7 @@ Workflow:
 - Screenshot coordinates: every screenshot reports its WxH frame; pass coordinates in that frame.
 - Close tabs you opened with tabs_close when you are finished, unless the user wants them kept.
 - If a tool reports an open JavaScript dialog (alert/confirm/prompt), resolve it with handle_dialog before anything else.
+- If a tool says Zen must be restarted to turn on remote control, ask the user first; only after they agree call tabs_context with restartBrowser: true.
 - Never enter passwords, payment details or other secrets on the user's behalf, and confirm with the user before irreversible actions (sending, purchasing, deleting, submitting).`;
 
 function text(t) {
@@ -136,10 +137,18 @@ export function createServer(config = loadConfig(), { log } = {}) {
       inputSchema: {
         createIfEmpty: z.boolean().optional().describe("If Claude has no tabs yet, open a new empty tab for this conversation."),
         all: z.boolean().optional().describe("List every open tab in the browser, not only the tabs Claude opened."),
+        restartBrowser: z
+          .boolean()
+          .optional()
+          .describe("Restart the user's Zen so remote control can be turned on. Only pass this after a tool said a restart is needed AND the user agreed."),
       },
       annotations: { readOnlyHint: false, openWorldHint: false },
     },
-    async ({ createIfEmpty, all }) => {
+    async ({ createIfEmpty, all, restartBrowser }) => {
+      const wasConnected = browser.connected;
+      await browser.ensure({ allowRestart: !!restartBrowser });
+      const restartNote = !wasConnected && browser.restarted ? "\nZen was restarted with remote control on; the user's tabs are being restored." : "";
+      browser.restarted = false;
       let res = await browser.listTabs({ all: !!all });
       let created = null;
       if (createIfEmpty && !res.tabs.some((t) => t.owned)) {
@@ -153,7 +162,7 @@ export function createServer(config = loadConfig(), { log } = {}) {
       let note = "";
       if (created != null) note = `\nCreated tab ${created} for this conversation.`;
       else if (!res.tabs.length) note = "\nNo Claude tabs yet. Use tabs_create (or tabs_context with createIfEmpty) to open one.";
-      return { content: [text(JSON.stringify(payload, null, 2) + note)] };
+      return { content: [text(JSON.stringify(payload, null, 2) + note + restartNote)] };
     },
   );
 

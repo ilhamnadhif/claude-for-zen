@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { findProfileOwner } from "../../src/launcher.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(here, "..", "..");
@@ -57,6 +58,18 @@ export async function startMcp(extraEnv = {}) {
     ZEN_SCREENSHOT_DIR: path.join(tmp, "shots"),
     ...extraEnv,
   };
+  // E2E_PROFILE_MODE=existing runs a suite as if the throwaway profile were the
+  // user's everyday one (it must exist; Claude may not quit it on exit).
+  if (process.env.E2E_PROFILE_MODE === "existing" && !extraEnv.ZEN_PROFILE_MODE) {
+    env.ZEN_PROFILE_MODE = "existing";
+    fs.mkdirSync(env.ZEN_PROFILE, { recursive: true });
+    fs.writeFileSync(
+      path.join(env.ZEN_PROFILE, "user.js"),
+      ['"browser.aboutwelcome.enabled", false', '"zen.welcome-screen.seen", true', '"browser.startup.homepage_override.mstone", "ignore"', '"trailhead.firstrun.didSeeAboutWelcome", true', '"datareporting.policy.dataSubmissionPolicyBypassNotification", true']
+        .map((p) => `user_pref(${p});`)
+        .join("\n") + "\n",
+    );
+  }
   const transport = new StdioClientTransport({ command: process.execPath, args: [BIN, "serve"], env, stderr: "pipe" });
   let stderr = "";
   transport.stderr?.on("data", (d) => {
@@ -87,8 +100,17 @@ export async function startMcp(extraEnv = {}) {
     try {
       await client.close();
     } catch {}
-    // Give the server a moment to quit the browser it launched.
+    // Give the server a moment to quit the browser it launched, then make sure
+    // nothing is left holding a throwaway profile this helper created.
     await new Promise((r) => setTimeout(r, 1500));
+    const ownProfile = path.resolve(env.ZEN_PROFILE).startsWith(tmp + path.sep);
+    const owner = ownProfile && fs.existsSync(env.ZEN_PROFILE) ? findProfileOwner(env.ZEN_PROFILE) : null;
+    if (owner?.pid) {
+      try {
+        process.kill(owner.pid, "SIGKILL");
+      } catch {}
+      await new Promise((r) => setTimeout(r, 500));
+    }
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 
@@ -104,3 +126,29 @@ export function refFor(treeText, pattern) {
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Read a Firefox/Zen .jsonlz4 session file ("mozLz40\0" + size + LZ4 block). */
+export function readMozLz4(file) {
+  const buf = fs.readFileSync(file);
+  if (buf.subarray(0, 8).toString("latin1") !== "mozLz40\0") return buf.toString("utf8");
+  const src = buf.subarray(12);
+  const out = Buffer.alloc(buf.readUInt32LE(8));
+  let i = 0;
+  let o = 0;
+  while (i < src.length) {
+    const token = src[i++];
+    let lit = token >> 4;
+    if (lit === 15) for (let b = 255; b === 255; ) lit += b = src[i++];
+    src.copy(out, o, i, i + lit);
+    i += lit;
+    o += lit;
+    if (i >= src.length) break;
+    const offset = src[i] | (src[i + 1] << 8);
+    i += 2;
+    let len = token & 15;
+    if (len === 15) for (let b = 255; b === 255; ) len += b = src[i++];
+    len += 4;
+    for (let k = 0; k < len; k++, o++) out[o] = out[o - offset];
+  }
+  return out.subarray(0, o).toString("utf8");
+}

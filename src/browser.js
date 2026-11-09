@@ -2,8 +2,20 @@
 // primitives the MCP tools are built from.
 
 import { BidiClient, BidiError, BidiTimeoutError } from "./bidi.js";
-import { endpointUrl } from "./config.js";
-import { launchBrowser, isPortOpen } from "./launcher.js";
+import { endpointUrl, defaultHome } from "./config.js";
+import {
+  launchBrowser,
+  isPortOpen,
+  findBinary,
+  findDefaultProfile,
+  findProfileOwner,
+  findPortListener,
+  processCommand,
+  quitGracefully,
+  waitForProfileRelease,
+  restoresTabs,
+  isZenBinary,
+} from "./launcher.js";
 import { installRuntime } from "./page/runtime.js";
 import { decodePng, encodeJpeg, fitScale, resize, MAX_EDGE, MAX_PIXELS } from "./image.js";
 import { formatException } from "./remote-value.js";
@@ -32,7 +44,8 @@ const HIDE_WEBDRIVER_FN = `() => {
   } catch (e) {}
 }`;
 
-const EVENTS = [
+// Tab bookkeeping: always subscribed for the whole browser.
+const CONTEXT_EVENTS = [
   "browsingContext.contextCreated",
   "browsingContext.contextDestroyed",
   "browsingContext.navigationStarted",
@@ -40,11 +53,10 @@ const EVENTS = [
   "browsingContext.load",
   "browsingContext.userPromptOpened",
   "browsingContext.userPromptClosed",
-  "log.entryAdded",
-  "network.beforeRequestSent",
-  "network.responseCompleted",
-  "network.fetchError",
 ];
+// Console and network: in the user's everyday profile only for the tabs Claude
+// works with, so the rest of their browsing never reaches this process.
+const TAB_EVENTS = ["log.entryAdded", "network.beforeRequestSent", "network.responseCompleted", "network.fetchError"];
 
 const MAX_CONSOLE = 2000;
 const MAX_NETWORK = 2000;
@@ -102,6 +114,7 @@ export class ZenBrowser {
     this.sessionId = null;
     this.launched = null;
     this.capabilities = null;
+    this.restarted = false; // the user's Zen was restarted to enable remote debugging
     this._reset();
   }
 
@@ -123,7 +136,17 @@ export class ZenBrowser {
     this.frameInfo = new Map(); // child context → {parent, token, localId}
     this.ctxToken = new Map(); // context → token of its current document
     this.coordScale = new Map(); // top context → {s, cssW, cssH, frameW, frameH}
+    this.watched = new Set(); // top contexts subscribed to TAB_EVENTS (existing profile)
     this.preloadId = null;
+  }
+
+  get existingProfile() {
+    return this.config.profileMode === "existing" && !this.config.connectOnly;
+  }
+
+  /** Subscribe to console/network for every tab, or only for the tabs Claude uses. */
+  get watchAll() {
+    return this.config.profileMode !== "existing";
   }
 
   // ---------------------------------------------------------------- connection
@@ -132,22 +155,29 @@ export class ZenBrowser {
     return !!this.client && this.client.connected && !!this.sessionId;
   }
 
-  async ensure() {
+  /**
+   * Connect (launching Zen if needed).
+   * @param {{allowRestart?: boolean}} opts allowRestart: the user agreed to
+   *   restart their running Zen so remote debugging can be turned on.
+   */
+  async ensure(opts = {}) {
     if (this.connected) return;
     if (!this.connecting) {
-      this.connecting = this._connect().finally(() => {
+      this.connecting = this._connect(opts).finally(() => {
         this.connecting = null;
       });
     }
     await this.connecting;
   }
 
-  async _connect() {
+  async _connect(opts = {}) {
     const { config } = this;
     const url = endpointUrl(config);
 
     if (!config.connectOnly) {
-      if (!(await isPortOpen(config.host, config.port))) {
+      if (this.existingProfile) {
+        await this.startExistingProfile(opts);
+      } else if (!(await isPortOpen(config.host, config.port))) {
         this.launched = await launchBrowser(config, this.log);
         this.log(`launched Zen (pid ${this.launched.pid})`);
       }
@@ -213,18 +243,7 @@ export class ZenBrowser {
       this.sessionId = null;
     });
 
-    // Subscribe one by one so an event unknown to an older browser does not fail all of them.
-    try {
-      await client.send("session.subscribe", { events: EVENTS });
-    } catch {
-      for (const ev of EVENTS) {
-        try {
-          await client.send("session.subscribe", { events: [ev] });
-        } catch (e) {
-          this.log(`could not subscribe to ${ev}: ${e.message}`);
-        }
-      }
-    }
+    await this._subscribe(this.watchAll ? [...CONTEXT_EVENTS, ...TAB_EVENTS] : CONTEXT_EVENTS);
 
     if (config.hideWebdriver) {
       try {
@@ -248,6 +267,115 @@ export class ZenBrowser {
     }
   }
 
+  /** Subscribe to events; one by one if needed, so an event unknown to an older browser does not fail the rest. */
+  async _subscribe(events, contexts) {
+    const params = contexts ? { events, contexts } : { events };
+    try {
+      await this.client.send("session.subscribe", params);
+    } catch {
+      for (const ev of events) {
+        try {
+          await this.client.send("session.subscribe", { ...params, events: [ev] });
+        } catch (e) {
+          this.log(`could not subscribe to ${ev}: ${e.message}`);
+        }
+      }
+    }
+  }
+
+  /** Start collecting console and network events for a tab Claude works with. */
+  async watch(ctx) {
+    if (this.watchAll || !ctx || this.watched.has(ctx) || !this.connected) return;
+    this.watched.add(ctx);
+    await this._subscribe(TAB_EVENTS, [ctx]);
+  }
+
+  /**
+   * Everyday-profile mode: make sure the user's own Zen is running with remote
+   * debugging, launching it or (with permission) restarting it.
+   */
+  async startExistingProfile({ allowRestart = false } = {}) {
+    const { config } = this;
+    let profileDir;
+    try {
+      profileDir = findDefaultProfile(config);
+    } catch (e) {
+      throw new UserError(e.message);
+    }
+    let binary = null;
+    try {
+      binary = findBinary(config);
+    } catch (e) {
+      throw new UserError(e.message);
+    }
+
+    let owner = findProfileOwner(profileDir);
+    if (await isPortOpen(config.host, config.port)) {
+      const listener = findPortListener(config.port);
+      if (listener == null || (owner && (owner.pid == null || owner.pid === listener))) return; // the user's Zen is listening
+      const cmd = processCommand(listener);
+      if (cmd.includes(defaultHome())) {
+        // Claude's separate profile from dedicated mode is holding the port: it's ours, close it.
+        this.log(`closing Claude's separate Zen profile (pid ${listener}) that holds port ${config.port}`);
+        if (!(await quitGracefully(listener, { timeoutMs: 15000 }))) {
+          throw new UserError(`Claude's separate Zen window (pid ${listener}) is using port ${config.port} and did not close. Quit it and try again.`);
+        }
+      } else {
+        throw new UserError(
+          `Port ${config.port} is used by another program (pid ${listener}${cmd ? `: ${cmd.slice(0, 120)}` : ""}), not by your Zen. ` +
+            `Set ZEN_BIDI_PORT to a free port.`,
+        );
+      }
+      owner = findProfileOwner(profileDir);
+    }
+
+    if (!owner) {
+      this.launched = await launchBrowser(config, this.log, { profileDir, existing: true });
+      this.log(`opened your Zen profile (pid ${this.launched.pid ?? "?"})`);
+      return;
+    }
+
+    // Zen is open without remote debugging, which can only be enabled at startup.
+    const policy = allowRestart ? "auto" : config.restart;
+    const comesBack = restoresTabs(profileDir, binary)
+      ? "all windows and tabs come back automatically (as when the user quits and reopens Zen), but anything typed into a page and not yet saved may be lost"
+      : "Zen is set to open a home page at startup, so only pinned tabs and Essentials come back; other open tabs will be closed";
+    if (owner.pid == null) {
+      throw new UserError(
+        "Zen is open, but its remote control (WebDriver BiDi) is off, and Claude can't restart it automatically on this system. " +
+          "Ask the user to quit Zen completely (all windows), then call tabs_context again: Claude will reopen Zen with their profile and remote control on.",
+      );
+    }
+    if (policy === "never") {
+      throw new UserError(
+        `Zen is open, but its remote control (WebDriver BiDi) is off, so Claude can't use it. ` +
+          `Ask the user to quit Zen and start it with "claude-for-zen launch" (or set ZEN_RESTART=ask to let Claude restart it).`,
+      );
+    }
+    if (policy !== "auto") {
+      throw new UserError(
+        `Zen is open, but its remote control (WebDriver BiDi) is off, so Claude can't use it yet. ` +
+          `Turning it on needs a one-time restart of Zen: ${comesBack}. ` +
+          `Ask the user whether Zen may be restarted now. If they agree, call tabs_context with restartBrowser: true.`,
+      );
+    }
+    this.log(`restarting Zen (pid ${owner.pid}) with remote debugging on port ${config.port}`);
+    if (!(await quitGracefully(owner.pid, { timeoutMs: 20000 }))) {
+      throw new UserError(
+        "Zen did not quit within 20 seconds. It is probably asking for confirmation (for example about closing tabs or a download in progress). " +
+          "Ask the user to answer that prompt or quit Zen, then call tabs_context with restartBrowser: true again.",
+      );
+    }
+    if (!(await waitForProfileRelease(profileDir, 10000))) {
+      throw new UserError("Zen quit but its profile is still locked. Wait a moment and call tabs_context with restartBrowser: true again.");
+    }
+    // Firefox restores the session for this one start; Zen restores per its own startup setting.
+    const oneShotPrefs = isZenBinary(binary) ? null : { "browser.sessionstore.resume_session_once": true };
+    this.launched = await launchBrowser(config, this.log, { profileDir, existing: true, oneShotPrefs });
+    this.restarted = true;
+    this.log(`restarted Zen (pid ${this.launched.pid ?? "?"})`);
+  }
+
   async send(method, params, opts) {
     await this.ensure();
     try {
@@ -266,7 +394,8 @@ export class ZenBrowser {
       } catch {}
       client.close();
     }
-    if (this.config.killOnExit && this.launched?.pid) {
+    // Never quit the user's everyday browser.
+    if (this.config.killOnExit && this.launched?.pid && this.config.profileMode !== "existing") {
       try {
         process.kill(this.launched.pid, "SIGTERM");
       } catch {}
@@ -302,6 +431,7 @@ export class ZenBrowser {
           if (opener && this.owned.has(this.topOf(opener))) {
             this.owned.add(params.context);
             this.tabIdFor(params.context);
+            this.watch(params.context).catch(() => {});
           }
         }
         break;
@@ -312,6 +442,7 @@ export class ZenBrowser {
         this.parents.delete(ctx);
         this.frameInfo.delete(ctx);
         this.owned.delete(ctx);
+        this.watched.delete(ctx);
         this.consoleBuf.delete(ctx);
         this.networkBuf.delete(ctx);
         this.prompts.delete(ctx);
@@ -464,6 +595,7 @@ export class ZenBrowser {
     if (!ctx || !this.topLevel.has(ctx)) {
       throw new UserError(`Tab ${tabId} not found. Call tabs_context to get valid tab IDs (or tabs_create to open a new tab).`);
     }
+    await this.watch(ctx);
     return ctx;
   }
 
@@ -492,26 +624,31 @@ export class ZenBrowser {
     await this.refreshTree();
     const params = { type: "tab", background: false };
     const ownedNow = [...this.owned].filter((c) => this.topLevel.has(c));
+    const everyday = this.config.profileMode === "existing" || this.config.connectOnly;
     if (ownedNow.length) {
+      // Keep Claude's tabs next to each other.
       params.referenceContext = ownedNow[ownedNow.length - 1];
-    } else if (this.config.connectOnly) {
-      // Using someone's everyday profile: keep Claude's work in its own window.
-      params.type = "window";
-    } else if (this.topLevel.size) {
+    } else if (!everyday && this.topLevel.size) {
       params.referenceContext = [...this.topLevel][0];
     }
+    // Otherwise (the user's own profile) Zen puts the tab in the window they used last.
     let res;
     try {
       res = await this.send("browsingContext.create", params);
     } catch (e) {
+      if (e instanceof UserError) throw e;
       if (params.referenceContext) {
         delete params.referenceContext;
         res = await this.send("browsingContext.create", params);
-      } else throw e;
+      } else {
+        // No browser window is open (e.g. all closed on macOS): open one.
+        res = await this.send("browsingContext.create", { type: "window", background: false });
+      }
     }
     const ctx = res.context;
     this.topLevel.add(ctx);
     this.owned.add(ctx);
+    await this.watch(ctx);
     const tabId = this.tabIdFor(ctx);
     if (url) await this.navigate(ctx, url);
     return tabId;

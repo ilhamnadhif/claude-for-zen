@@ -39,6 +39,14 @@ export const MANAGED_PREFS = {
   "browser.warnOnQuitShortcut": false,
 };
 
+// Prefs written to the user's everyday profile (ZEN_PROFILE_MODE=existing):
+// only what claude-for-zen depends on, nothing that changes normal browsing.
+export const EXISTING_PROFILE_PREFS = {
+  "remote.prefs.recommended": false,
+  "dom.successive_dialog_time_limit": 0,
+  "dom.file.createInChild": true,
+};
+
 function isExecutable(p) {
   try {
     fs.accessSync(p, fs.constants.X_OK);
@@ -115,9 +123,13 @@ function prefValue(v) {
   return String(v);
 }
 
-/** Create the profile directory and (re)write our managed block in user.js. */
-export function prepareProfile(profileDir) {
-  fs.mkdirSync(profileDir, { recursive: true });
+/**
+ * (Re)write our managed block in the profile's user.js, keeping everything else.
+ * Creates the profile directory unless `create` is false (existing profiles).
+ */
+export function prepareProfile(profileDir, prefs = MANAGED_PREFS, { create = true } = {}) {
+  if (create) fs.mkdirSync(profileDir, { recursive: true });
+  else if (!fs.statSync(profileDir).isDirectory()) throw new Error(`${profileDir} is not a directory`);
   const userJs = path.join(profileDir, "user.js");
   let existing = "";
   try {
@@ -130,7 +142,7 @@ export function prepareProfile(profileDir) {
   }
   const block = [
     USER_JS_BEGIN,
-    ...Object.entries(MANAGED_PREFS).map(([k, v]) => `user_pref(${JSON.stringify(k)}, ${prefValue(v)});`),
+    ...Object.entries(prefs).map(([k, v]) => `user_pref(${JSON.stringify(k)}, ${prefValue(v)});`),
     USER_JS_END,
   ].join("\n");
   const rest = existing.trim();
@@ -173,57 +185,322 @@ export function findProcessesUsingProfile(profileDir) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * Launch the browser with the dedicated profile and wait for the BiDi port.
- * The browser is detached so it outlives this process (like Chrome does for
- * Claude in Chrome); set ZEN_KILL_ON_EXIT=1 to tie its lifetime to the server.
- * @returns {Promise<{pid: number, binary: string}>}
- */
-export async function launchBrowser(config, log = () => {}) {
-  const binary = findBinary(config);
-  const running = findProcessesUsingProfile(config.profileDir);
-  if (running.length) {
-    throw new Error(
-      `The Claude Zen profile (${config.profileDir}) is already open in another Zen process ` +
-        `(pid ${running.map((r) => r.pid).join(", ")}) without remote debugging on port ${config.port}. ` +
-        `Close that Zen window and try again.`,
-    );
-  }
-  prepareProfile(config.profileDir);
+// ------------------------------------------------------------ everyday profile
 
-  const args = ["-profile", config.profileDir, "-no-remote", "--remote-debugging-port", String(config.port)];
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+/** Is this binary Zen (as opposed to Firefox or another fork)? */
+export function isZenBinary(binary) {
+  return /(^|[\\/])zen[^\\/]*$|zen[^\\/]*\.app[\\/]|zen[_-]browser/i.test(binary || "");
+}
+
+/** Directories that may hold profiles.ini, most likely first. */
+export function profileRoots(binary) {
+  const home = os.homedir();
+  let zen;
+  let firefox;
+  if (process.platform === "darwin") {
+    zen = [path.join(home, "Library/Application Support/zen")];
+    firefox = [path.join(home, "Library/Application Support/Firefox")];
+  } else if (process.platform === "win32") {
+    const appData = process.env.APPDATA || path.join(home, "AppData", "Roaming");
+    zen = [path.join(appData, "zen")];
+    firefox = [path.join(appData, "Mozilla", "Firefox")];
+  } else {
+    zen = [path.join(home, ".zen"), path.join(home, ".config/zen"), path.join(home, ".var/app/app.zen_browser.zen/.zen")];
+    firefox = [
+      path.join(home, ".mozilla/firefox"),
+      path.join(home, ".config/mozilla/firefox"),
+      path.join(home, "snap/firefox/common/.mozilla/firefox"),
+      path.join(home, ".var/app/org.mozilla.firefox/.mozilla/firefox"),
+    ];
+  }
+  return binary && !isZenBinary(binary) ? [...firefox, ...zen] : [...zen, ...firefox];
+}
+
+/** Parse profiles.ini and return the default profile's absolute path (or null). */
+export function defaultProfileFromIni(text, root) {
+  const sections = [];
+  let cur = null;
+  for (const raw of String(text).split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith(";") || line.startsWith("#")) continue;
+    const m = line.match(/^\[(.+)\]$/);
+    if (m) {
+      cur = { name: m[1], values: {} };
+      sections.push(cur);
+    } else if (cur) {
+      const i = line.indexOf("=");
+      if (i > 0) cur.values[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+    }
+  }
+  const resolve = (p, relative = true) => (relative && !path.isAbsolute(p) ? path.join(root, p) : p);
+  // Firefox 67+: the profile this installation uses is recorded per install.
+  const install = sections.find((s) => /^Install/i.test(s.name) && s.values.Default);
+  if (install) return resolve(install.values.Default);
+  const profiles = sections.filter((s) => /^Profile\d+$/i.test(s.name) && s.values.Path);
+  const def = profiles.find((s) => s.values.Default === "1") || profiles[0];
+  if (!def) return null;
+  return resolve(def.values.Path, def.values.IsRelative !== "0");
+}
+
+/** Locate the profile the user's browser normally opens. */
+export function findDefaultProfile(config) {
+  if (config.profileDir) {
+    if (!fs.existsSync(config.profileDir)) throw new Error(`ZEN_PROFILE points to ${config.profileDir}, which does not exist.`);
+    return config.profileDir;
+  }
+  let binary = null;
+  try {
+    binary = findBinary(config);
+  } catch {}
+  for (const root of profileRoots(binary)) {
+    let text;
+    try {
+      text = fs.readFileSync(path.join(root, "profiles.ini"), "utf8");
+    } catch {
+      continue;
+    }
+    const dir = defaultProfileFromIni(text, root);
+    if (dir && fs.existsSync(dir)) return dir;
+  }
+  throw new Error(
+    "Could not find your Zen profile. Set ZEN_PROFILE to its folder " +
+      '(open about:profiles in Zen and copy the "Root Directory" of the profile in use).',
+  );
+}
+
+function run(cmd, args, timeout = 5000) {
+  return execFileSync(cmd, args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout });
+}
+
+/**
+ * Which process has this profile open? Returns {pid} (pid may be null when the
+ * profile is locked but the owner can't be identified) or null.
+ */
+export function findProfileOwner(profileDir) {
+  if (process.platform === "win32") {
+    const lock = path.join(profileDir, "parent.lock");
+    if (!fs.existsSync(lock)) return null;
+    try {
+      fs.closeSync(fs.openSync(lock, "r+"));
+      return null; // stale lock file
+    } catch (e) {
+      return e.code === "EBUSY" || e.code === "EPERM" || e.code === "EACCES" ? { pid: null } : null;
+    }
+  }
+  const parentLock = path.join(profileDir, ".parentlock");
+  if (fs.existsSync(parentLock)) {
+    try {
+      const pids = run("lsof", ["-t", "--", parentLock]).split(/\s+/).map(Number).filter((p) => p > 0 && isAlive(p));
+      if (pids.length) return { pid: pids[0] };
+    } catch {}
+  }
+  // Linux also keeps a "lock" symlink pointing at "<ip>:+<pid>".
+  try {
+    const m = fs.readlinkSync(path.join(profileDir, "lock")).match(/\+(\d+)$/);
+    if (m && isAlive(Number(m[1]))) return { pid: Number(m[1]) };
+  } catch {}
+  const procs = findProcessesUsingProfile(profileDir);
+  return procs.length ? { pid: procs[0].pid } : null;
+}
+
+/** pid of the process listening on a local TCP port, or null if unknown. */
+export function findPortListener(port) {
+  if (process.platform === "win32") return null;
+  try {
+    const pid = Number(run("lsof", ["-nP", "-t", `-iTCP:${port}`, "-sTCP:LISTEN"]).split(/\s+/)[0]);
+    return pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+export function processCommand(pid) {
+  if (!pid || process.platform === "win32") return "";
+  try {
+    return run("ps", ["-ww", "-o", "command=", "-p", String(pid)]).trim();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Ask a browser process to quit the way the user would (Cmd+Q / closing the
+ * last window), so it saves its session. Resolves true once it has exited.
+ */
+export async function quitGracefully(pid, { timeoutMs = 20000 } = {}) {
+  if (!pid) return false;
+  if (process.platform === "darwin") {
+    let sent = false;
+    try {
+      // NSRunningApplication.terminate sends the standard Quit Apple Event to exactly this process.
+      const out = run("osascript", [
+        "-l",
+        "JavaScript",
+        "-e",
+        `ObjC.import("AppKit"); const a = $.NSRunningApplication.runningApplicationWithProcessIdentifier(${Number(pid)}); a.isNil() ? "nil" : String(a.terminate)`,
+      ], 10000).trim();
+      sent = out === "true";
+    } catch {}
+    if (!sent) {
+      try {
+        process.kill(pid, "SIGTERM");
+      } catch {}
+    }
+  } else if (process.platform === "win32") {
+    try {
+      run("taskkill", ["/PID", String(pid)], 10000); // WM_CLOSE, no /F
+    } catch {}
+  } else {
+    try {
+      process.kill(pid, "SIGTERM"); // Firefox quits normally on SIGTERM
+    } catch {}
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isAlive(pid)) return true;
+    await sleep(200);
+  }
+  return !isAlive(pid);
+}
+
+/** Wait until no process holds the profile lock. */
+export async function waitForProfileRelease(profileDir, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!findProfileOwner(profileDir)) return true;
+    await sleep(200);
+  }
+  return false;
+}
+
+/** The value of a pref as stored in the profile (user.js wins over prefs.js), or undefined. */
+export function readProfilePref(profileDir, name) {
+  let value;
+  for (const file of ["prefs.js", "user.js"]) {
+    let text;
+    try {
+      text = fs.readFileSync(path.join(profileDir, file), "utf8");
+    } catch {
+      continue;
+    }
+    const re = new RegExp(`user_pref\\(\\s*${JSON.stringify(name).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*,\\s*([^)]*?)\\s*\\)\\s*;`, "g");
+    for (const m of text.matchAll(re)) {
+      try {
+        value = JSON.parse(m[1]);
+      } catch {
+        value = m[1];
+      }
+    }
+  }
+  return value;
+}
+
+/** Will the browser bring all tabs back after a restart of this profile? */
+export function restoresTabs(profileDir, binary) {
+  const page = readProfilePref(profileDir, "browser.startup.page");
+  // Zen ships with "restore previous session" (3) as its default; Firefox with 1.
+  return (page ?? (isZenBinary(binary) ? 3 : 1)) === 3;
+}
+
+function macBundle(binary) {
+  const m = process.platform === "darwin" && binary.match(/^(.*?\.app)\/Contents\/MacOS\/[^/]+$/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Launch the browser with WebDriver BiDi enabled and wait for the port.
+ *
+ * Dedicated profile (default): the profile is created if needed and gets the
+ * MANAGED_PREFS; the browser is detached so it outlives this process (like
+ * Chrome does for Claude in Chrome); ZEN_KILL_ON_EXIT=1 ties its lifetime to
+ * the server.
+ *
+ * Existing profile: opens the user's own browser the way the OS would (on
+ * macOS through LaunchServices), with only EXISTING_PROFILE_PREFS added.
+ * `oneShotPrefs` are applied for this start only.
+ * @returns {Promise<{pid: number|null, binary: string}>}
+ */
+export async function launchBrowser(config, log = () => {}, { profileDir = config.profileDir, existing = false, oneShotPrefs = null } = {}) {
+  const binary = findBinary(config);
+  const prefs = existing ? EXISTING_PROFILE_PREFS : MANAGED_PREFS;
+  if (existing) {
+    if (findProfileOwner(profileDir)) throw new Error(`The profile ${profileDir} is already open in Zen.`);
+    prepareProfile(profileDir, { ...prefs, ...(oneShotPrefs || {}) }, { create: false });
+  } else {
+    const running = findProcessesUsingProfile(profileDir);
+    if (running.length) {
+      throw new Error(
+        `The Claude Zen profile (${profileDir}) is already open in another Zen process ` +
+          `(pid ${running.map((r) => r.pid).join(", ")}) without remote debugging on port ${config.port}. ` +
+          `Close that Zen window and try again.`,
+      );
+    }
+    prepareProfile(profileDir, prefs);
+  }
+
+  const args = ["-profile", profileDir];
+  if (!existing) args.push("-no-remote");
+  args.push("--remote-debugging-port", String(config.port));
   if (config.headless) args.push("-headless");
   args.push(...config.extraArgs);
 
-  log(`launching ${binary} ${args.join(" ")}`);
-  const child = spawn(binary, args, {
-    detached: true,
-    stdio: "ignore",
-    env: { ...process.env, MOZ_CRASHREPORTER_DISABLE: "1" },
-  });
+  let pid = null;
   let exited = null;
-  child.once("exit", (code, signal) => {
-    exited = { code, signal };
-  });
-  child.once("error", (err) => {
-    exited = { error: err };
-  });
-  child.unref();
-
-  const deadline = Date.now() + config.launchTimeoutMs;
-  while (Date.now() < deadline) {
-    if (await isPortOpen(config.host, config.port)) {
-      return { pid: child.pid, binary };
-    }
-    // Firefox on Linux may fork and exit its launcher process with code 0;
-    // only treat a non-zero exit as fatal.
-    if (exited && (exited.error || (exited.code && exited.code !== 0))) {
-      throw new Error(`Zen exited during startup (${exited.error?.message || `code ${exited.code}`}).`);
-    }
-    await sleep(250);
+  const bundle = existing ? macBundle(binary) : null;
+  if (bundle) {
+    // A normal app launch (Dock icon, Apple Events, no inherited environment).
+    log(`launching ${bundle} ${args.join(" ")}`);
+    execFileSync("open", ["-n", "-a", bundle, "--args", ...args], { stdio: "ignore", timeout: 30000 });
+  } else {
+    log(`launching ${binary} ${args.join(" ")}`);
+    const child = spawn(binary, args, {
+      detached: true,
+      stdio: "ignore",
+      env: existing ? process.env : { ...process.env, MOZ_CRASHREPORTER_DISABLE: "1" },
+    });
+    pid = child.pid;
+    child.once("exit", (code, signal) => {
+      exited = { code, signal };
+    });
+    child.once("error", (err) => {
+      exited = { error: err };
+    });
+    child.unref();
   }
-  throw new Error(
-    `Zen did not open its remote debugging port ${config.port} within ${Math.round(config.launchTimeoutMs / 1000)}s. ` +
-      `Is another program using that port? Set ZEN_BIDI_PORT to change it.`,
-  );
+
+  try {
+    const deadline = Date.now() + config.launchTimeoutMs;
+    while (Date.now() < deadline) {
+      if (await isPortOpen(config.host, config.port)) {
+        if (existing) pid = findProfileOwner(profileDir)?.pid ?? pid;
+        return { pid, binary };
+      }
+      // Firefox on Linux may fork and exit its launcher process with code 0;
+      // only treat a non-zero exit as fatal.
+      if (exited && (exited.error || (exited.code && exited.code !== 0))) {
+        throw new Error(`Zen exited during startup (${exited.error?.message || `code ${exited.code}`}).`);
+      }
+      await sleep(250);
+    }
+    throw new Error(
+      `Zen did not open its remote debugging port ${config.port} within ${Math.round(config.launchTimeoutMs / 1000)}s. ` +
+        `Is another program using that port? Set ZEN_BIDI_PORT to change it.`,
+    );
+  } finally {
+    // Zen has read user.js by the time the port opens (or gave up); drop one-shot prefs.
+    if (existing && oneShotPrefs) {
+      try {
+        prepareProfile(profileDir, prefs, { create: false });
+      } catch {}
+    }
+  }
 }
