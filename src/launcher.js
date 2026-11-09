@@ -333,8 +333,17 @@ export function processCommand(pid) {
 }
 
 /**
- * Ask a browser process to quit the way the user would (Cmd+Q / closing the
- * last window), so it saves its session. Resolves true once it has exited.
+ * Can a running browser be asked to quit the way the user would (saving its
+ * session)? On macOS the standard Quit Apple Event does exactly that. On Linux,
+ * Firefox exits on SIGTERM without writing its session (measured with Firefox
+ * 159, headed and headless), and Windows offers no per-process equivalent, so
+ * there the user quits the browser themselves.
+ */
+export const CAN_RESTART_BROWSER = process.platform === "darwin";
+
+/**
+ * Ask a browser process to quit the way the user would (Cmd+Q), so it saves
+ * its session. Resolves true once it has exited.
  */
 export async function quitGracefully(pid, { timeoutMs = 20000 } = {}) {
   if (!pid) return false;

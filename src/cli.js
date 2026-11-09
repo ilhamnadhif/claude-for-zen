@@ -15,6 +15,7 @@ import {
   prepareProfile,
   restoresTabs,
   EXISTING_PROFILE_PREFS,
+  CAN_RESTART_BROWSER,
 } from "./launcher.js";
 import { VERSION } from "./version.js";
 
@@ -109,7 +110,11 @@ function install(argv) {
   if (r.status !== 0) process.exit(r.status || 1);
   console.log(`\nInstalled. Start a new Claude Code session and ask it to use Zen, e.g. "open example.com in Zen and take a screenshot".`);
   if (mode === "existing") {
-    console.log("Claude will open its tabs in your Zen window. If Zen is already open without remote control, Claude asks before restarting it once.");
+    console.log(
+      CAN_RESTART_BROWSER
+        ? "Claude will open its tabs in your Zen window. If Zen is already open without remote control, Claude asks before restarting it once."
+        : "Claude will open its tabs in your Zen window. If Zen is already open without remote control, Claude asks you to quit it once and then reopens it.",
+    );
   }
   console.log(`Tools appear as mcp__${name}__*. Run "claude-for-zen doctor" to verify the browser side.`);
 }
@@ -136,6 +141,10 @@ async function launch(argv) {
     const dir = findDefaultProfile(config);
     if (await isPortOpen(config.host, config.port)) {
       console.log(`Zen is already running with remote control on (port ${config.port}).`);
+      return;
+    }
+    if (findProfileOwner(dir) && !CAN_RESTART_BROWSER) {
+      console.log("Zen is open without remote control. Quit Zen (Ctrl+Q), then run this command again.");
       return;
     }
     if (findProfileOwner(dir) && !flags.restart) {
@@ -202,7 +211,12 @@ async function doctor() {
     line(null, `Port ${config.port}: Zen is listening`);
   } else if (existing && profileDir) {
     if (findProfileOwner(profileDir)) {
-      line(null, `Zen is open without remote control. Claude will ask before restarting it once (or run "claude-for-zen launch --restart").`);
+      line(
+        null,
+        CAN_RESTART_BROWSER
+          ? `Zen is open without remote control. Claude will ask before restarting it once (or run "claude-for-zen launch --restart").`
+          : `Zen is open without remote control. Quit Zen and run "claude-for-zen launch" (or let Claude open it after you quit).`,
+      );
     } else {
       line(null, "Zen is not running; it will be opened with your profile on first use.");
     }

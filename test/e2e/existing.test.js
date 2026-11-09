@@ -1,8 +1,9 @@
 // End-to-end tests for ZEN_PROFILE_MODE=existing: Claude uses the user's own,
 // already running browser. A throwaway profile plays the user's everyday Zen:
-// it is started normally (no remote debugging), then Claude has to ask before
-// restarting it, restarts it with the user's tabs, and opens its tab in the
-// user's window.
+// it is started normally (no remote debugging). On macOS Claude has to ask
+// before restarting it and restarts it with the user's tabs; elsewhere it asks
+// the user to quit it and reopens it. Either way Claude's tab goes into the
+// user's window and the browser is left running.
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -13,7 +14,7 @@ import path from "node:path";
 import WebSocket from "ws";
 import { startFixtureServer, startMcp, freePort, sleep, readMozLz4 } from "./helpers.js";
 import { loadConfig } from "../../src/config.js";
-import { findBinary, findProfileOwner, quitGracefully } from "../../src/launcher.js";
+import { findBinary, findProfileOwner, quitGracefully, CAN_RESTART_BROWSER, waitForProfileRelease } from "../../src/launcher.js";
 
 const parseTabs = (text) => JSON.parse(text.slice(0, text.indexOf("\n}") + 2));
 
@@ -116,30 +117,45 @@ describe("existing profile mode (e2e)", { timeout: 600000 }, () => {
     fx?.server.close();
   });
 
-  it("asks before restarting the user's running Zen", async () => {
+  it("asks before touching the user's running Zen", async () => {
     const r = await mcp.call("tabs_context", {}, { expectError: true });
     assert.match(r.text, /remote control .* is off/);
     assert.match(r.text, /Ask the user/);
-    assert.match(r.text, /restartBrowser: true/);
-    assert.match(r.text, /come back/);
+    if (CAN_RESTART_BROWSER) {
+      assert.match(r.text, /restartBrowser: true/);
+      assert.match(r.text, /come back/);
+    } else {
+      assert.match(r.text, /quit Zen/);
+      assert.doesNotMatch(r.text, /restartBrowser/);
+      // Even if asked to, Claude never kills the browser where it can't quit it cleanly.
+      await mcp.call("tabs_context", { restartBrowser: true }, { expectError: true });
+    }
     assert.ok(alive(userPid), "Zen must not be touched without permission");
     // Other tools give the same answer instead of launching a second Zen.
     const n = await mcp.call("tabs_create", { url: `${fx.base}/main.html` }, { expectError: true });
-    assert.match(n.text, /restartBrowser: true/);
+    assert.match(n.text, /remote control .* is off/);
     assert.ok(alive(userPid));
   });
 
-  it("restarts Zen once allowed, with the user's profile and tabs", async (t) => {
-    const r = await mcp.call("tabs_context", { restartBrowser: true, all: true });
-    assert.match(r.text, /Zen was restarted with remote control on/);
-    assert.ok(!alive(userPid), "the old process quit");
+  it(CAN_RESTART_BROWSER ? "restarts Zen once allowed, with the user's profile and tabs" : "reopens the user's Zen after they quit it", async (t) => {
+    if (CAN_RESTART_BROWSER) {
+      const r = await mcp.call("tabs_context", { restartBrowser: true, all: true });
+      assert.match(r.text, /Zen was restarted with remote control on/);
+      assert.ok(!alive(userPid), "the old process quit");
+    } else {
+      process.kill(userPid, "SIGKILL"); // the user quits Zen
+      assert.ok(await waitForProfileRelease(dir, 10000));
+      const r = await mcp.call("tabs_context", { all: true });
+      assert.doesNotMatch(r.text, /restarted/);
+    }
     const owner = findProfileOwner(dir);
-    assert.ok(owner?.pid && owner.pid !== userPid, "the same profile is open in the restarted Zen");
+    assert.ok(owner?.pid && owner.pid !== userPid, "the same profile is open in Zen again, with remote control");
 
     const userJs = fs.readFileSync(path.join(dir, "user.js"), "utf8");
     assert.match(userJs, /remote\.prefs\.recommended", false/);
     assert.match(userJs, /zen\.welcome-screen\.seen/, "the user's own prefs are kept");
     assert.doesNotMatch(userJs, /focusmanager\.testmode|resume_session_once/);
+    if (!CAN_RESTART_BROWSER) return;
 
     // Restored tabs may load lazily (no browsing context until selected); the
     // last test checks the session itself.
@@ -192,7 +208,7 @@ describe("existing profile mode (e2e)", { timeout: 600000 }, () => {
     assert.equal(findProfileOwner(dir)?.pid, pidBefore, "no restart the second time");
   });
 
-  it("kept the user's tab through the restart (session after a normal quit)", async () => {
+  it("kept the user's tab through the restart (session after a normal quit)", { skip: !CAN_RESTART_BROWSER && "automatic restart is macOS-only" }, async () => {
     await mcp?.close();
     mcp = null;
     const pid = findProfileOwner(dir)?.pid;

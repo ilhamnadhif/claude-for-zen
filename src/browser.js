@@ -15,6 +15,7 @@ import {
   waitForProfileRelease,
   restoresTabs,
   isZenBinary,
+  CAN_RESTART_BROWSER,
 } from "./launcher.js";
 import { installRuntime } from "./page/runtime.js";
 import { decodePng, encodeJpeg, fitScale, resize, MAX_EDGE, MAX_PIXELS } from "./image.js";
@@ -340,10 +341,10 @@ export class ZenBrowser {
     const comesBack = restoresTabs(profileDir, binary)
       ? "all windows and tabs come back automatically (as when the user quits and reopens Zen), but anything typed into a page and not yet saved may be lost"
       : "Zen is set to open a home page at startup, so only pinned tabs and Essentials come back; other open tabs will be closed";
-    if (owner.pid == null) {
+    if (owner.pid == null || !CAN_RESTART_BROWSER) {
       throw new UserError(
-        "Zen is open, but its remote control (WebDriver BiDi) is off, and Claude can't restart it automatically on this system. " +
-          "Ask the user to quit Zen completely (all windows), then call tabs_context again: Claude will reopen Zen with their profile and remote control on.",
+        "Zen is open, but its remote control (WebDriver BiDi) is off, so Claude can't use it yet, and on this system Claude can't restart Zen without risking the user's tabs. " +
+          `Ask the user to quit Zen (${process.platform === "darwin" ? "Cmd" : "Ctrl"}+Q), then call tabs_context again: Claude will reopen Zen with their profile and remote control on.`,
       );
     }
     if (policy === "never") {
