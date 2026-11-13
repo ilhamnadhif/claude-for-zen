@@ -41,6 +41,7 @@ Environment (set with "claude mcp add -e KEY=VALUE" or install -e):
   ZEN_RESTART          existing mode, Zen open without remote control: ask (default) | auto | never
   ZEN_OWN_WINDOW=0     existing mode: open Claude's tabs in your current window instead of a window of its own
   ZEN_HELPER_ADDON=1   existing mode: use the "Claude for Zen" add-on so Zen never needs a restart (install --no-restart)
+  ZEN_SHARED_SESSION=0 Don't share Zen between Claude Code sessions (connect directly, one session at a time)
   ZEN_BINARY           Path to the Zen executable (auto-detected)
   ZEN_PROFILE          Profile directory (dedicated default ~/.claude-for-zen/profile;
                        existing default: the profile Zen normally opens)
@@ -344,6 +345,13 @@ export async function main(argv) {
       return uninstall(rest);
     case "launch":
       return launch(rest);
+    case "broker": {
+      // Internal: the detached session broker started by `serve` (src/broker.js).
+      const { runBroker } = await import("./broker.js");
+      const [host = "127.0.0.1", port] = rest;
+      await runBroker(host, Number(port), { log: process.env.ZEN_DEBUG ? (m) => process.stderr.write(`[claude-for-zen broker] ${m}\n`) : () => {} });
+      return;
+    }
     case "doctor":
       return doctor();
     case "-v":

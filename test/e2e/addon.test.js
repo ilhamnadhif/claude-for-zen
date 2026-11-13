@@ -28,8 +28,14 @@ let binary = null;
 try {
   binary = findBinary(loadConfig());
 } catch {}
-const skip = !binary || !isZenBinary(binary) ? "needs Zen (Firefox release refuses unsigned add-ons)" : false;
 const AGENT_PORT = 9222; // the port Firefox's runtime-started remote agent always uses
+const skip =
+  !binary || !isZenBinary(binary)
+    ? "needs Zen (Firefox release refuses unsigned add-ons)"
+    : (await isPortOpen("127.0.0.1", AGENT_PORT))
+      ? `port ${AGENT_PORT} is in use (for example by your own Zen's add-on while Claude uses it)`
+      : false;
+const parseFirstTab = (text) => JSON.parse(text.slice(0, text.indexOf("\n}") + 2)).tabs[0].tabId;
 
 describe("helper add-on: no restart (e2e)", { timeout: 600000, skip }, () => {
   let fx;
@@ -55,7 +61,6 @@ describe("helper add-on: no restart (e2e)", { timeout: 600000, skip }, () => {
     // What `claude-for-zen install --no-restart` does while Zen is closed.
     prepareProfile(dir, existingProfilePrefs({ helperAddon: true }), { create: false });
     assert.ok(sideloadAddon(dir));
-    assert.equal(await isPortOpen("127.0.0.1", AGENT_PORT), false, `port ${AGENT_PORT} must be free for this test`);
   });
 
   after(async () => {
@@ -125,6 +130,29 @@ describe("helper add-on: no restart (e2e)", { timeout: 600000, skip }, () => {
     assert.equal(findProfileOwner(dir)?.pid, pid);
     await mcp.close();
     mcp = null;
+  });
+
+  it("keeps remote control on until the last of two sessions leaves", async () => {
+    const first = await startMcp(env());
+    const second = await startMcp(env());
+    try {
+      await first.call("tabs_context", { createIfEmpty: true });
+      await second.call("tabs_context", { createIfEmpty: true });
+      assert.equal(findProfileOwner(dir)?.pid, pid, "still no restart");
+      await first.close({ keepBrowser: true });
+      await sleep(800);
+      assert.ok(await isPortOpen("127.0.0.1", AGENT_PORT), "on while the second session works");
+      const shot = await second.call("computer", { action: "screenshot", tabId: Number(parseFirstTab((await second.call("tabs_context", {})).text)) });
+      assert.equal(shot.images.length, 1);
+    } finally {
+      await second.close({ keepBrowser: true });
+    }
+    let off = false;
+    for (let i = 0; i < 30 && !off; i++) {
+      await sleep(200);
+      off = !(await isPortOpen("127.0.0.1", AGENT_PORT));
+    }
+    assert.ok(off, "off after the last session");
   });
 
   it("opens Zen without the remote debugging flag when it is not running", async () => {

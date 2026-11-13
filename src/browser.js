@@ -22,6 +22,7 @@ import {
 } from "./launcher.js";
 import { installRuntime } from "./page/runtime.js";
 import { KEY } from "./keys.js";
+import { ensureBroker } from "./broker.js";
 import {
   ADDON_VERSION,
   addonInfo,
@@ -216,7 +217,16 @@ export class ZenBrowser {
 
     // The helper add-on may have switched remote control on at its own port.
     const url = config.bidiUrl || `ws://${config.host}:${this.port}/session`;
-    const client = new BidiClient(url, { commandTimeoutMs: config.commandTimeoutMs, log: this.log });
+    // Zen allows one BiDi session; the broker shares it with other Claude Code sessions.
+    let connectUrl = url;
+    if (config.sharedSession && !config.bidiUrl) {
+      try {
+        connectUrl = await ensureBroker(config.host, this.port, { log: this.log });
+      } catch (e) {
+        this.log(`session broker unavailable (${e.message}); connecting directly`);
+      }
+    }
+    const client = new BidiClient(connectUrl, { commandTimeoutMs: config.commandTimeoutMs, log: this.log });
     try {
       await client.connect(5000);
     } catch (e) {
@@ -257,8 +267,8 @@ export class ZenBrowser {
         client.close();
         if (busy) {
           throw new UserError(
-            "Another client is already controlling this Zen instance (WebDriver BiDi allows one session at a time). " +
-              "Close the other Claude Code session that is using Zen, or give each session its own instance with a different ZEN_BIDI_PORT and ZEN_PROFILE.",
+            "Another program is controlling this Zen instance (WebDriver BiDi allows one session at a time, and it is not shared through claude-for-zen's broker). " +
+              "Close that program (or an older claude-for-zen), or quit and reopen Zen.",
           );
         }
         throw e;
@@ -482,6 +492,17 @@ export class ZenBrowser {
     this._addonChecked = true;
     const info = addonInfo(this.profileDir);
     if (info && compareVersions(info.version, ADDON_VERSION) >= 0) return;
+    if (this.control) {
+      // Connected through the add-on: reinstalling would restart it and switch
+      // remote control off under us. Leave the new version in the profile; Zen
+      // loads it at its next start (the old file stays valid until then).
+      try {
+        if (sideloadAddon(this.profileDir)) this.log(`helper add-on ${ADDON_VERSION} will be used from Zen's next start`);
+      } catch (e) {
+        this.log(`could not copy the helper add-on into the profile: ${e.message}`);
+      }
+      return;
+    }
     try {
       await this.client.send(
         "webExtension.install",
@@ -512,19 +533,26 @@ export class ZenBrowser {
 
   async shutdown() {
     const client = this.client;
+    let otherClients = 0; // other Claude Code sessions still using this Zen (through the broker)
     if (client && client.connected) {
       try {
-        await client.send("session.end", {}, { timeoutMs: 2000 });
+        const r = await client.send("session.end", {}, { timeoutMs: 2000 });
+        otherClients = Number(r?.["cfz:otherClients"]) || 0;
       } catch {}
       client.close();
     }
     // Lets the helper add-on switch remote control off again.
     this._closeControl();
     // Never quit the user's everyday browser.
-    if (this.config.killOnExit && this.launched?.pid && this.config.profileMode !== "existing") {
-      try {
-        process.kill(this.launched.pid, "SIGTERM");
-      } catch {}
+    // ZEN_KILL_ON_EXIT: the last Claude Code session to leave quits Claude's own
+    // Zen, whichever session launched it.
+    if (this.config.killOnExit && this.config.profileMode !== "existing" && !this.config.connectOnly && otherClients === 0) {
+      const pid = this.launched?.pid || (this.config.profileDir && findProfileOwner(this.config.profileDir)?.pid);
+      if (pid) {
+        try {
+          process.kill(pid, "SIGTERM");
+        } catch {}
+      }
     }
   }
 

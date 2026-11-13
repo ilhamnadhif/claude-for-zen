@@ -57,6 +57,9 @@ export function loadConfig(env = process.env) {
     // existing mode: install the helper add-on that switches remote control
     // on and off while Zen runs, so Zen never has to be restarted for Claude.
     helperAddon: truthy(env.ZEN_HELPER_ADDON),
+    // Share the browser's single WebDriver BiDi session between Claude Code
+    // sessions through a local broker process (src/broker.js).
+    sharedSession: env.ZEN_SHARED_SESSION == null ? true : truthy(env.ZEN_SHARED_SESSION),
     // existing mode: null means "the profile Zen normally opens" (profiles.ini).
     profileDir: explicitProfile ?? (profileMode === "existing" ? null : path.join(defaultHome(), "profile")),
     headless: truthy(env.ZEN_HEADLESS),

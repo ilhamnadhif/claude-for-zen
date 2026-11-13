@@ -61,7 +61,16 @@ async function bidi(port, fn) {
       ws.send(JSON.stringify({ id: myId, method, params }));
     });
   try {
-    await send("session.new", { capabilities: {} });
+    // The session broker keeps the session for a few seconds after its last client.
+    for (let i = 0; ; i++) {
+      try {
+        await send("session.new", { capabilities: {} });
+        break;
+      } catch (e) {
+        if (i >= 40 || !/maximum|active session/i.test(e.message)) throw e;
+        await sleep(250);
+      }
+    }
     return await fn(send);
   } finally {
     try {

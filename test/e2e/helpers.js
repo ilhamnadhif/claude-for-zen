@@ -96,10 +96,12 @@ export async function startMcp(extraEnv = {}) {
     }
   }
 
-  async function close() {
+  async function close({ keepBrowser = false } = {}) {
     try {
       await client.close();
     } catch {}
+    // Another session still uses the browser: leave it and its profile alone.
+    if (keepBrowser) return;
     // Give the server a moment to quit the browser it launched, then make sure
     // nothing is left holding a throwaway profile this helper created.
     await new Promise((r) => setTimeout(r, 1500));

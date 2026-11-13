@@ -10,8 +10,11 @@ import { ADDON_ID, ADDON_VERSION, addonInfo, addonState, buildXpi, compareVersio
 
 const pkg = JSON.parse(fs.readFileSync(new URL("../../package.json", import.meta.url), "utf8"));
 
-test("the add-on version follows the package version", () => {
-  assert.equal(ADDON_VERSION, pkg.version);
+test("the add-on has a valid id and version", () => {
+  // Versioned on its own: bump it only when extension/ changes, since an
+  // update restarts the add-on in the user's browser.
+  assert.match(ADDON_VERSION, /^\d+\.\d+\.\d+$/);
+  assert.ok(compareVersions(ADDON_VERSION, pkg.version) <= 0);
   assert.equal(ADDON_ID, "claude-for-zen@ilhamnadhif.github.io");
 });
 
