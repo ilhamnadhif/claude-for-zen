@@ -26,7 +26,7 @@ const HELP = `claude-for-zen ${VERSION} — let Claude Code drive Zen Browser
 Usage:
   claude-for-zen [serve]        Run the MCP server on stdio (what Claude Code launches)
   claude-for-zen install        Register the MCP server with Claude Code (user scope)
-         [--existing-profile]   Use your everyday Zen (new tabs in your window) instead of a separate profile
+         [--existing-profile]   Use your everyday Zen profile (Claude gets its own window, your logins) instead of a separate profile
          [--name zen] [--scope user|local|project] [-e KEY=VALUE ...]
   claude-for-zen uninstall      Remove it from Claude Code  [--name zen] [--scope user]
   claude-for-zen launch         Start Zen with remote control on (dedicated mode: Claude's profile,
@@ -37,6 +37,7 @@ Usage:
 Environment (set with "claude mcp add -e KEY=VALUE" or install -e):
   ZEN_PROFILE_MODE     "dedicated" (default, Claude's own profile) or "existing" (your everyday profile)
   ZEN_RESTART          existing mode, Zen open without remote control: ask (default) | auto | never
+  ZEN_OWN_WINDOW=0     existing mode: open Claude's tabs in your current window instead of a window of its own
   ZEN_BINARY           Path to the Zen executable (auto-detected)
   ZEN_PROFILE          Profile directory (dedicated default ~/.claude-for-zen/profile;
                        existing default: the profile Zen normally opens)
@@ -112,8 +113,8 @@ function install(argv) {
   if (mode === "existing") {
     console.log(
       CAN_RESTART_BROWSER
-        ? "Claude will open its tabs in your Zen window. If Zen is already open without remote control, Claude asks before restarting it once."
-        : "Claude will open its tabs in your Zen window. If Zen is already open without remote control, Claude asks you to quit it once and then reopens it.",
+        ? "Claude will open its tabs in a Zen window of its own, with your profile and logins. If Zen is already open without remote control, Claude asks before restarting it once."
+        : "Claude will open its tabs in a Zen window of its own, with your profile and logins. If Zen is already open without remote control, Claude asks you to quit it once and then reopens it.",
     );
   }
   console.log(`Tools appear as mcp__${name}__*. Run "claude-for-zen doctor" to verify the browser side.`);
@@ -193,7 +194,7 @@ async function doctor() {
     if (existing) {
       try {
         profileDir = findDefaultProfile(config);
-        line(true, `Mode: your everyday Zen profile (${profileDir}); Claude opens new tabs in your window`);
+        line(true, `Mode: your everyday Zen profile (${profileDir}); Claude opens its tabs in ${config.ownWindow ? "a window of its own" : "your current window"}`);
       } catch (e) {
         line(false, e.message);
         ok = false;

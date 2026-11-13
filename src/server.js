@@ -24,7 +24,7 @@ Workflow:
 - Call tabs_context first. Each conversation should open its own tab with tabs_create (or navigate without a tabId) instead of reusing tabs, unless the user asks to work in an existing tab.
 - Look before acting: take a screenshot (computer action "screenshot") or use read_page / find to get element refs. Prefer clicking by ref; refs survive scrolling and work inside iframes.
 - Screenshot coordinates: every screenshot reports its WxH frame; pass coordinates in that frame.
-- Close tabs you opened with tabs_close when you are finished, unless the user wants them kept.
+- Close tabs you opened with tabs_close when you are finished, unless the user wants them kept. In the user's everyday profile Claude's tabs live in a Zen window of their own (same logins); closing the last one closes that window.
 - If a tool reports an open JavaScript dialog (alert/confirm/prompt), resolve it with handle_dialog before anything else.
 - If a tool says Zen must be restarted to turn on remote control, ask the user first; only after they agree call tabs_context with restartBrowser: true.
 - Never enter passwords, payment details or other secrets on the user's behalf, and confirm with the user before irreversible actions (sending, purchasing, deleting, submitting).`;
@@ -171,7 +171,8 @@ export function createServer(config = loadConfig(), { log } = {}) {
     {
       title: "Open a new Zen tab",
       description:
-        "Open a new tab for this conversation and return its tab ID. Tabs you create are yours to clean up: close each one with tabs_close when you no longer need it, unless the user wants it kept open.",
+        "Open a new tab for this conversation and return its tab ID. When Claude works in the user's everyday Zen profile, its tabs open in a Zen window of their own (same profile and logins), separate from the user's tabs. " +
+          "Tabs you create are yours to clean up: close each one with tabs_close when you no longer need it, unless the user wants it kept open.",
       inputSchema: {
         url: z.string().optional().describe("Optional URL to load in the new tab."),
       },
@@ -188,7 +189,8 @@ export function createServer(config = loadConfig(), { log } = {}) {
     "tabs_close",
     {
       title: "Close a Zen tab",
-      description: "Close a tab Claude opened. Use it to clean up tabs you are done with. Closing a tab Claude did not open requires force=true and should only be done when the user asks.",
+      description:
+        "Close a tab Claude opened. Use it to clean up tabs you are done with; closing the last tab of Claude's own window closes that window. Closing a tab Claude did not open requires force=true and should only be done when the user asks.",
       inputSchema: {
         tabId: tabIdSchema,
         force: z.boolean().optional().describe("Allow closing a tab that Claude did not open (only when the user asked)."),
@@ -200,9 +202,9 @@ export function createServer(config = loadConfig(), { log } = {}) {
       if (!browser.owned.has(top) && !force) {
         throw new UserError(`Tab ${tabId} was not opened by Claude in this session. Only close it if the user asked (pass force=true).`);
       }
-      await browser.closeTab(top);
+      const { windowClosed } = await browser.closeTab(top);
       recordings.delete(Number(tabId));
-      return { content: [text(`Closed tab ${tabId}.`)] };
+      return { content: [text(`Closed tab ${tabId}.${windowClosed ? " It was the last tab in Claude's window, so the window was closed too." : ""}`)] };
     },
   );
 

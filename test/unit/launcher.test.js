@@ -102,6 +102,9 @@ test("profile mode configuration", () => {
   const c = loadConfig({ ZEN_PROFILE_MODE: "Existing", ZEN_PROFILE: "/tmp/p", ZEN_RESTART: "auto" });
   assert.equal(c.profileDir, path.resolve("/tmp/p"));
   assert.equal(c.restart, "auto");
+  assert.equal(a.ownWindow, true);
+  assert.equal(loadConfig({ ZEN_OWN_WINDOW: "0" }).ownWindow, false);
+  assert.equal(loadConfig({ ZEN_OWN_WINDOW: "yes" }).ownWindow, true);
   assert.throws(() => loadConfig({ ZEN_PROFILE_MODE: "mine" }), /ZEN_PROFILE_MODE/);
   assert.throws(() => loadConfig({ ZEN_RESTART: "sometimes" }), /ZEN_RESTART/);
 });

@@ -370,7 +370,9 @@ export async function quitGracefully(pid, { timeoutMs = 20000 } = {}) {
     } catch {}
   } else {
     try {
-      process.kill(pid, "SIGTERM"); // Firefox quits normally on SIGTERM
+      // Exits without saving the session on Linux (see CAN_RESTART_BROWSER), so
+      // this is only used for browsers whose session doesn't matter.
+      process.kill(pid, "SIGTERM");
     } catch {}
   }
   const deadline = Date.now() + timeoutMs;
@@ -389,6 +391,60 @@ export async function waitForProfileRelease(profileDir, timeoutMs = 10000) {
     await sleep(200);
   }
   return false;
+}
+
+const bundleIds = new Map();
+
+/** CFBundleIdentifier of the macOS app containing `binary` (e.g. "app.zen-browser.zen"), or null. */
+export function macBundleId(binary) {
+  const bundle = binary && macBundle(binary);
+  if (!bundle) return null;
+  if (!bundleIds.has(bundle)) {
+    let id = null;
+    try {
+      id = run("plutil", ["-extract", "CFBundleIdentifier", "raw", path.join(bundle, "Contents", "Info.plist")]).trim() || null;
+    } catch {}
+    bundleIds.set(bundle, id);
+  }
+  return bundleIds.get(bundle);
+}
+
+/**
+ * macOS: close the window of app `bundleId` whose title is exactly `name`, the
+ * way clicking its close button would. Apple Events reach the app by bundle id
+ * (with several instances running, the first one), so callers give the window
+ * a unique title: a miss closes nothing. Returns "closed", "none" or "error".
+ */
+export function closeMacWindowByName(bundleId, name) {
+  if (process.platform !== "darwin" || !bundleId || !/^[\w.:-]+$/.test(name)) return "error";
+  try {
+    return run("osascript", [
+      "-l",
+      "JavaScript",
+      "-e",
+      `const app = Application(${JSON.stringify(bundleId)});
+const matches = app.windows.whose({ name: ${JSON.stringify(name)} });
+if (matches.length === 0) { "none" } else { app.close(matches[0]); "closed" }`,
+    ], 5000).trim();
+  } catch {
+    return "error";
+  }
+}
+
+/** macOS: bring the app with this pid to the front (exactly that process). */
+export function activateMacApp(pid) {
+  if (process.platform !== "darwin" || !pid) return false;
+  try {
+    const out = run("osascript", [
+      "-l",
+      "JavaScript",
+      "-e",
+      `ObjC.import("AppKit"); const a = $.NSRunningApplication.runningApplicationWithProcessIdentifier(${Number(pid)}); a.isNil() ? "nil" : String(a.activateWithOptions($.NSApplicationActivateIgnoringOtherApps))`,
+    ], 5000).trim();
+    return out === "true";
+  } catch {
+    return false;
+  }
 }
 
 /** The value of a pref as stored in the profile (user.js wins over prefs.js), or undefined. */

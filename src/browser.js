@@ -16,8 +16,12 @@ import {
   restoresTabs,
   isZenBinary,
   CAN_RESTART_BROWSER,
+  macBundleId,
+  closeMacWindowByName,
+  activateMacApp,
 } from "./launcher.js";
 import { installRuntime } from "./page/runtime.js";
+import { KEY } from "./keys.js";
 import { decodePng, encodeJpeg, fitScale, resize, MAX_EDGE, MAX_PIXELS } from "./image.js";
 import { formatException } from "./remote-value.js";
 
@@ -138,7 +142,19 @@ export class ZenBrowser {
     this.ctxToken = new Map(); // context → token of its current document
     this.coordScale = new Map(); // top context → {s, cssW, cssH, frameW, frameH}
     this.watched = new Set(); // top contexts subscribed to TAB_EVENTS (existing profile)
+    this.ctxWindow = new Map(); // top context → clientWindow id
+    this.claudeWindow = null; // the window Claude opened for its tabs (everyday profile)
     this.preloadId = null;
+  }
+
+  /** Everyday profile (or connect-only): Claude works next to the user's own browsing. */
+  get everydayProfile() {
+    return this.config.profileMode === "existing" || this.config.connectOnly;
+  }
+
+  /** Should Claude's tabs live in a window of their own? */
+  get useOwnWindow() {
+    return this.everydayProfile && this.config.ownWindow;
   }
 
   get existingProfile() {
@@ -416,6 +432,7 @@ export class ZenBrowser {
     else {
       this.topLevel.add(info.context);
       if (!this.urls.has(info.context)) this.urls.set(info.context, info.url);
+      if (info.clientWindow) this.ctxWindow.set(info.context, info.clientWindow);
     }
     for (const child of info.children || []) this._registerContextTree(child, info.context);
   }
@@ -428,6 +445,7 @@ export class ZenBrowser {
         } else {
           this.topLevel.add(params.context);
           this.urls.set(params.context, params.url);
+          if (params.clientWindow) this.ctxWindow.set(params.context, params.clientWindow);
           const opener = params.originalOpener;
           if (opener && this.owned.has(this.topOf(opener))) {
             this.owned.add(params.context);
@@ -444,6 +462,7 @@ export class ZenBrowser {
         this.frameInfo.delete(ctx);
         this.owned.delete(ctx);
         this.watched.delete(ctx);
+        this.ctxWindow.delete(ctx);
         this.consoleBuf.delete(ctx);
         this.networkBuf.delete(ctx);
         this.prompts.delete(ctx);
@@ -623,16 +642,32 @@ export class ZenBrowser {
   async createTab(url) {
     await this.ensure();
     await this.refreshTree();
-    const params = { type: "tab", background: false };
     const ownedNow = [...this.owned].filter((c) => this.topLevel.has(c));
-    const everyday = this.config.profileMode === "existing" || this.config.connectOnly;
-    if (ownedNow.length) {
-      // Keep Claude's tabs next to each other.
-      params.referenceContext = ownedNow[ownedNow.length - 1];
-    } else if (!everyday && this.topLevel.size) {
-      params.referenceContext = [...this.topLevel][0];
+    let params;
+    if (this.useOwnWindow) {
+      // Claude's tabs go into a window of its own (same profile, so the user's
+      // logins work). In Zen it is an unsynced window: the user's tabs don't
+      // appear in it and Claude's tabs don't appear in the user's windows.
+      const inOwnWindow = ownedNow.filter((c) => this.claudeWindow && this.ctxWindow.get(c) === this.claudeWindow);
+      if (inOwnWindow.length) {
+        params = { type: "tab", background: false, referenceContext: inOwnWindow[inOwnWindow.length - 1] };
+      } else {
+        const ctx = await this._openOwnWindow();
+        // Without a URL, don't leave the window-opening marker in the address.
+        if (ctx) return this._adoptTab(ctx, url || ((this.urls.get(ctx) || "").includes("claude-for-zen=") ? "about:blank" : undefined), { ownWindow: true });
+        // Could not open a window: fall back to a tab in the user's window.
+        params = { type: "tab", background: false };
+      }
+    } else {
+      params = { type: "tab", background: false };
+      if (ownedNow.length) {
+        // Keep Claude's tabs next to each other.
+        params.referenceContext = ownedNow[ownedNow.length - 1];
+      } else if (!this.everydayProfile && this.topLevel.size) {
+        params.referenceContext = [...this.topLevel][0];
+      }
+      // Otherwise (the user's own profile) Zen puts the tab in the window they used last.
     }
-    // Otherwise (the user's own profile) Zen puts the tab in the window they used last.
     let res;
     try {
       res = await this.send("browsingContext.create", params);
@@ -641,22 +676,171 @@ export class ZenBrowser {
       if (params.referenceContext) {
         delete params.referenceContext;
         res = await this.send("browsingContext.create", params);
-      } else {
+      } else if (params.type !== "window") {
         // No browser window is open (e.g. all closed on macOS): open one.
         res = await this.send("browsingContext.create", { type: "window", background: false });
-      }
+      } else throw e;
     }
-    const ctx = res.context;
+    return this._adoptTab(res.context, url, { ownWindow: params.type === "window" });
+  }
+
+  /** Register a new tab as Claude's, optionally as the first tab of Claude's window, and load `url`. */
+  async _adoptTab(ctx, url, { ownWindow = false } = {}) {
     this.topLevel.add(ctx);
     this.owned.add(ctx);
+    if (!this.ctxWindow.has(ctx)) await this.refreshTree();
+    if (ownWindow) this.claudeWindow = this.ctxWindow.get(ctx) || null;
     await this.watch(ctx);
     const tabId = this.tabIdFor(ctx);
     if (url) await this.navigate(ctx, url);
     return tabId;
   }
 
+  /**
+   * Open a browser window for Claude in the profile it is connected to and
+   * bring it to the front. Returns the context of its tab, or null.
+   */
+  async _openOwnWindow() {
+    let ctx = null;
+    try {
+      // Firefox: WebDriver BiDi opens windows directly.
+      ctx = (await this.send("browsingContext.create", { type: "window", background: false })).context;
+    } catch (e) {
+      if (e instanceof UserError) throw e;
+      if (!(e instanceof BidiError && /unsupported operation/i.test(e.code))) this.log(`window create failed: ${e.message}`);
+      // Zen: the remote agent only opens windows for Firefox. Do what a person
+      // would: Shift+click a link, which Zen opens in a new window kept
+      // separate from the user's synced windows.
+      ctx = await this._openWindowByShiftClick();
+    }
+    if (!ctx) return null;
+    try {
+      await this.send("browsingContext.activate", { context: ctx });
+    } catch {}
+    if (!this.config.headless) activateMacApp(findPortListener(this.config.port));
+    return ctx;
+  }
+
+  async _openWindowByShiftClick() {
+    const token = Math.random().toString(36).slice(2, 12);
+    const marker = `about:blank?claude-for-zen=${token}`;
+    let host;
+    try {
+      // A throwaway background tab hosts the link, so no page of the user's is touched.
+      host = (await this.send("browsingContext.create", { type: "tab", background: true })).context;
+    } catch (e) {
+      this.log(`could not open a host tab: ${e.message}`);
+      return null;
+    }
+    try {
+      await this.send(
+        "script.evaluate",
+        {
+          expression: `(() => { const a = document.createElement("a"); a.href = ${JSON.stringify(marker)}; a.textContent = "Claude"; a.style.cssText = "position:fixed;inset:0;display:block"; document.body.appendChild(a); })()`,
+          target: { context: host },
+          awaitPromise: false,
+          resultOwnership: "none",
+        },
+        { timeoutMs: 5000 },
+      );
+      await this.send("input.performActions", {
+        context: host,
+        actions: [
+          { type: "key", id: "cfz-kbd", actions: [{ type: "keyDown", value: KEY.Shift }, { type: "pause", duration: 0 }, { type: "pause", duration: 0 }, { type: "pause", duration: 0 }, { type: "keyUp", value: KEY.Shift }] },
+          {
+            type: "pointer",
+            id: "cfz-mouse",
+            parameters: { pointerType: "mouse" },
+            actions: [{ type: "pause", duration: 0 }, { type: "pointerMove", x: 20, y: 20 }, { type: "pointerDown", button: 0 }, { type: "pointerUp", button: 0 }, { type: "pause", duration: 0 }],
+          },
+        ],
+      });
+      await this.send("input.releaseActions", { context: host }).catch(() => {});
+      const deadline = Date.now() + 8000;
+      for (let i = 1; Date.now() < deadline; i++) {
+        await sleep(100);
+        let found = [...this.topLevel].find((c) => (this.urls.get(c) || "").includes(token));
+        if (!found && i % 10 === 0) {
+          // Events can lag behind; ask for the tree once a second.
+          const tree = await this.send("browsingContext.getTree", { maxDepth: 0 });
+          const hit = tree.contexts.find((c) => (c.url || "").includes(token));
+          if (hit) {
+            this._registerContextTree(hit);
+            this.urls.set(hit.context, hit.url);
+            found = hit.context;
+          }
+        }
+        if (found) return found;
+      }
+      this.log("no window appeared after the Shift+click");
+      return null;
+    } catch (e) {
+      this.log(`opening a window failed: ${e.message}`);
+      return null;
+    } finally {
+      await this.send("browsingContext.close", { context: host, promptUnload: false }).catch(() => {});
+    }
+  }
+
+  /**
+   * Close a tab. When it is the last tab of Claude's own window, close that
+   * window too: Zen keeps a window open (with an empty tab) when its last tab
+   * closes, and WebDriver BiDi has no command to close a window.
+   * @returns {Promise<{windowClosed: boolean}>}
+   */
   async closeTab(ctx) {
+    await this.refreshTree();
+    const win = this.ctxWindow.get(ctx);
+    // Zen keeps an empty about:blank tab in every window; it doesn't count.
+    const others = [...this.topLevel].filter(
+      (c) => c !== ctx && this.ctxWindow.get(c) === win && (this.owned.has(c) || (this.urls.get(c) || "about:blank") !== "about:blank"),
+    );
+    const lastInOwnWindow = this.useOwnWindow && win && win === this.claudeWindow && others.length === 0;
+    if (lastInOwnWindow && (await this._closeOwnWindow(ctx))) {
+      this.claudeWindow = null;
+      return { windowClosed: true };
+    }
     await this.send("browsingContext.close", { context: ctx, promptUnload: false });
+    return { windowClosed: false };
+  }
+
+  /** macOS: close the window holding `ctx` through the app's AppleScript support. */
+  async _closeOwnWindow(ctx) {
+    if (process.platform !== "darwin" || this.config.headless) return false;
+    let bundleId = null;
+    try {
+      bundleId = macBundleId(findBinary(this.config));
+    } catch {}
+    if (!bundleId) return false;
+    // AppleScript knows windows by title, which is the selected tab's title:
+    // give the tab a unique one first.
+    const token = `claude-for-zen-close-${Math.random().toString(36).slice(2, 10)}`;
+    try {
+      const r = await this.send(
+        "script.evaluate",
+        { expression: `document.title = ${JSON.stringify(token)}`, target: { context: ctx }, awaitPromise: false, resultOwnership: "none" },
+        { timeoutMs: 3000 },
+      );
+      if (r.type === "exception") return false;
+    } catch {
+      return false;
+    }
+    const deadline = Date.now() + 1500;
+    let outcome = "none";
+    while (Date.now() < deadline) {
+      outcome = closeMacWindowByName(bundleId, token);
+      if (outcome !== "none") break;
+      await sleep(100);
+    }
+    if (outcome !== "closed") return false;
+    // Wait for the browser to report the tab gone (a beforeunload prompt keeps it open).
+    const until = Date.now() + 3000;
+    while (Date.now() < until) {
+      if (!this.topLevel.has(ctx)) return true;
+      await sleep(100);
+    }
+    await this.refreshTree();
+    return !this.topLevel.has(ctx);
   }
 
   // -------------------------------------------------------------- page access

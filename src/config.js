@@ -51,6 +51,9 @@ export function loadConfig(env = process.env) {
     profileMode,
     // existing mode: what to do when Zen is open without remote debugging.
     restart,
+    // existing / connect-only mode: Claude opens its tabs in a window of its own
+    // (same profile) instead of the window the user is using.
+    ownWindow: env.ZEN_OWN_WINDOW == null ? true : truthy(env.ZEN_OWN_WINDOW),
     // existing mode: null means "the profile Zen normally opens" (profiles.ini).
     profileDir: explicitProfile ?? (profileMode === "existing" ? null : path.join(defaultHome(), "profile")),
     headless: truthy(env.ZEN_HEADLESS),

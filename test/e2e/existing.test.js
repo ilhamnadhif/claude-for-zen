@@ -2,8 +2,9 @@
 // already running browser. A throwaway profile plays the user's everyday Zen:
 // it is started normally (no remote debugging). On macOS Claude has to ask
 // before restarting it and restarts it with the user's tabs; elsewhere it asks
-// the user to quit it and reopens it. Either way Claude's tab goes into the
-// user's window and the browser is left running.
+// the user to quit it and reopens it. Either way Claude's tabs go into a window
+// of their own (same profile; in Zen an unsynced window) and the browser is
+// left running.
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -168,10 +169,13 @@ describe("existing profile mode (e2e)", { timeout: 600000 }, () => {
     t.diagnostic(restored ? `restored tab is live: ${restored.url}` : "restored tab is lazy");
   });
 
-  it("opens Claude's tab in the user's window and works normally", async () => {
+  it("opens Claude's tabs in a window of their own and works normally", async () => {
     const created = await mcp.call("tabs_create", { url: `${fx.base}/main.html` });
     tab = Number(created.text.match(/Created tab (\d+)/)[1]);
     assert.match(created.text, /CFZ Test Page/);
+    // A second tab joins Claude's window instead of opening another one.
+    const second = await mcp.call("tabs_create", { url: `${fx.base}/frame.html?second=1` });
+    assert.match(second.text, /Created tab \d+/);
 
     const shot = await mcp.call("computer", { action: "screenshot", tabId: tab });
     assert.equal(shot.images.length, 1);
@@ -184,7 +188,7 @@ describe("existing profile mode (e2e)", { timeout: 600000 }, () => {
     assert.match(net.text, /api\/data\?page=existing/);
 
     const mine = parseTabs((await mcp.call("tabs_context", {})).text);
-    assert.deepEqual(mine.tabs.map((t) => t.tabId), [tab], "only Claude's tab is listed by default");
+    assert.equal(mine.tabs.length, 2, "only Claude's tabs are listed by default");
   });
 
   it("leaves the user's Zen running and lets the next session connect without a restart", async (t) => {
@@ -194,13 +198,18 @@ describe("existing profile mode (e2e)", { timeout: 600000 }, () => {
     await sleep(500);
     assert.ok(pidBefore && alive(pidBefore), "the user's Zen keeps running after Claude disconnects (even with ZEN_KILL_ON_EXIT=1)");
 
-    const windows = await bidi(port, async (send) => {
-      const tree = await send("browsingContext.getTree", { maxDepth: 0 });
-      return { urls: tree.contexts.map((c) => c.url), windows: new Set(tree.contexts.map((c) => c.clientWindow).filter(Boolean)) };
-    });
-    t.diagnostic(`top-level contexts: ${windows.urls.join(" | ")}; windows: ${windows.windows.size}`);
-    assert.ok(windows.urls.some((u) => u.includes("/main.html")), "Claude's tab is still open");
-    if (windows.windows.size) assert.equal(windows.windows.size, 1, "no extra window was opened");
+    const contexts = await bidi(port, async (send) => (await send("browsingContext.getTree", { maxDepth: 0 })).contexts);
+    t.diagnostic(`top-level contexts: ${contexts.map((c) => `${(c.clientWindow || "?").slice(0, 6)} ${c.url}`).join(" | ")}`);
+    const main = contexts.find((c) => c.url.includes("/main.html"));
+    const second = contexts.find((c) => c.url.includes("second=1"));
+    assert.ok(main && second, "Claude's tabs are still open");
+    if (main.clientWindow) {
+      assert.equal(second.clientWindow, main.clientWindow, "Claude's tabs share one window");
+      const userWindows = new Set(contexts.filter((c) => c !== main && c !== second && c.clientWindow !== main.clientWindow).map((c) => c.clientWindow));
+      assert.ok(userWindows.size >= 1, "the user's window is a different one");
+      const strangers = contexts.filter((c) => c.clientWindow === main.clientWindow && c !== main && c !== second && c.url !== "about:blank");
+      assert.deepEqual(strangers.map((c) => c.url), [], "none of the user's pages are in Claude's window");
+    }
 
     mcp = await startMcp({ ZEN_PROFILE_MODE: "existing", ZEN_PROFILE: dir, ZEN_BIDI_PORT: String(port) });
     const r = await mcp.call("tabs_context", { all: true });
@@ -219,5 +228,16 @@ describe("existing profile mode (e2e)", { timeout: 600000 }, () => {
     const text = main.map((f) => readMozLz4(f)).join("\n");
     assert.match(text, /everyday=1/, "the tab the user had open before the restart is still in their session");
     assert.match(text, /main\.html/, "Claude's tab is in the same session");
+    // Claude's window is kept apart from the user's (Zen: an unsynced window).
+    const store = path.join(dir, "sessionstore.jsonlz4");
+    if (fs.existsSync(store)) {
+      const urlsOf = (w) => w.tabs.map((tb) => (tb.entries?.[tb.index - 1] || tb.entries?.at(-1) || {}).url || "");
+      const wins = JSON.parse(readMozLz4(store)).windows.map(urlsOf);
+      const claudeWin = wins.find((u) => u.some((x) => x.includes("/main.html")));
+      const userWin = wins.find((u) => u.some((x) => x.includes("everyday=1")));
+      assert.ok(claudeWin && userWin && claudeWin !== userWin, `separate windows: ${JSON.stringify(wins)}`);
+      assert.ok(!userWin.some((x) => x.includes("/main.html")), "Claude's tabs are not mirrored into the user's window");
+      assert.ok(!claudeWin.some((x) => x.includes("everyday=1")), "the user's tabs are not mirrored into Claude's window");
+    }
   });
 });
