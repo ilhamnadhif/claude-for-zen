@@ -1,6 +1,6 @@
 {
   "name": "claude-for-zen",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Let Claude Code drive Zen Browser (and other Firefox-based browsers) the way Claude in Chrome drives Chrome — an MCP server built on WebDriver BiDi.",
   "type": "module",
   "main": "src/server.js",
@@ -10,6 +10,7 @@
   "files": [
     "bin",
     "src",
+    "extension",
     "README.md",
     "LICENSE"
   ],

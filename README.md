@@ -35,8 +35,8 @@ Claude in Chrome uses a Chrome extension and the Chrome DevTools Protocol. Firef
 | --- | --- | --- |
 | Where Claude works | A Zen window of its own **in your profile**: your logins work, and Zen keeps it apart from your tabs. It comes to the front when Claude starts and closes when Claude closes its last tab (`ZEN_OWN_WINDOW=0`: tabs in the window you use instead) | A separate Zen window with its own profile |
 | Your logins, extensions, bookmarks | Available | Sign in once inside Claude's profile (`claude-for-zen launch`) |
-| Setup cost | Zen must run with remote control on. It can only be switched on at startup, so if Zen is already open, Claude **asks you once** and restarts it; your windows and tabs come back as after a normal quit (macOS; on Linux and Windows Claude asks you to quit Zen and then reopens it) | None; Claude's Zen starts on first use |
-| Side effects on your browsing | While Zen runs with remote control on, pages can see `navigator.webdriver === true` when Claude isn't connected (some sign-in pages treat that as automation), and other programs on your computer could connect to it | None |
+| Setup cost | **With `--no-restart` (Zen):** none. The "Claude for Zen" add-on switches remote control on while Claude works and off afterwards; Zen is never restarted. **Without it:** remote control can only be switched on at startup, so if Zen is already open Claude **asks you once** and restarts it (macOS; on Linux and Windows it asks you to quit Zen and then reopens it) | None; Claude's Zen starts on first use |
+| Side effects on your browsing | With `--no-restart`: Zen accepts add-ons that aren't signed by Mozilla (see below). Without it: while Zen runs with remote control on, pages can see `navigator.webdriver === true` when Claude isn't connected, and other programs on your computer could connect to it | None |
 
 Pick the everyday mode if you want Claude to work in your normal browser with your accounts. Pick the dedicated mode if you want automation kept apart from your personal browsing.
 
@@ -55,7 +55,11 @@ git clone https://github.com/ilhamnadhif/claude-for-zen.git
 cd claude-for-zen
 npm install
 
-# Either: Claude works in your everyday Zen profile (its own window, your logins)
+# Either: Claude works in your everyday Zen profile (its own window, your logins),
+# and Zen never needs a restart (installs the "Claude for Zen" helper add-on)
+node bin/claude-for-zen.js install --no-restart
+
+# Or: everyday profile without the add-on (Zen is restarted once when needed)
 node bin/claude-for-zen.js install --existing-profile
 
 # Or: Claude gets its own separate Zen profile
@@ -72,7 +76,9 @@ claude mcp add --scope user zen -e ZEN_PROFILE_MODE=existing -- npx -y github:il
 
 Start a new Claude Code session and ask for something in Zen ("open example.com in Zen and take a screenshot"). The tools appear as `mcp__zen__*`.
 
-**Everyday mode, first use:** if Zen is open, Claude tells you it needs to restart Zen once and waits for your OK (on Linux and Windows it asks you to quit Zen, then opens it again itself). You can avoid that by quitting Zen and starting it with `node bin/claude-for-zen.js launch` (on macOS also `launch --restart`). Remote control then stays on until you quit Zen.
+**`--no-restart`, first use:** the next time Zen starts it shows that "Claude for Zen" was added; choose **Enable**. That's all: from then on Claude switches remote control on when it needs Zen and off when it is done, while Zen keeps running. (Until then Claude falls back to the restart below.)
+
+**Everyday mode without the add-on, first use:** if Zen is open, Claude tells you it needs to restart Zen once and waits for your OK (on Linux and Windows it asks you to quit Zen, then opens it again itself). You can avoid that by quitting Zen and starting it with `node bin/claude-for-zen.js launch` (on macOS also `launch --restart`). Remote control then stays on until you quit Zen.
 
 **Dedicated mode:** to sign in to sites for Claude, open its profile with `node bin/claude-for-zen.js launch` and log in as usual.
 
@@ -109,6 +115,7 @@ Set environment variables with `claude-for-zen install -e KEY=VALUE` or `claude 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `ZEN_PROFILE_MODE` | `dedicated` | `existing`: use your everyday profile, new tabs in your window. `dedicated`: Claude's own profile |
+| `ZEN_HELPER_ADDON` | `0` | Everyday mode: use the "Claude for Zen" add-on so Zen never needs a restart (`install --no-restart` sets it) |
 | `ZEN_OWN_WINDOW` | `1` | Everyday mode: Claude opens its tabs in a window of its own (same profile). `0`: in the window you are using |
 | `ZEN_RESTART` | `ask` | Everyday mode on macOS, Zen open without remote control: `ask` (Claude asks you first), `auto` (restart without asking), `never` (tell you to restart it yourself). On Linux and Windows Claude always asks you to quit Zen |
 | `ZEN_PROFILE` | see meaning | Profile directory. Dedicated: `~/.claude-for-zen/profile`. Everyday: the profile Zen normally opens (from `profiles.ini`) |
@@ -123,6 +130,18 @@ Set environment variables with `claude-for-zen install -e KEY=VALUE` or `claude 
 | `ZEN_GIF_DIR` | `~/Downloads` | Where GIF exports go |
 | `ZEN_NAVIGATION_TIMEOUT_MS` | `30000` | How long `navigate` waits for a page to load |
 | `ZEN_DEBUG` | `0` | Verbose logs on stderr |
+
+### The "Claude for Zen" add-on (`--no-restart`)
+
+Firefox can switch its WebDriver BiDi remote agent on and off while it runs (`RemoteAgent.startAtRuntime`), but only privileged browser code may do that. The add-on in [`extension/`](extension/) is that code: a WebExtension experiment of about 200 lines that
+
+- listens on a random `127.0.0.1` port and writes it, with a random token, to `claude-for-zen.json` in your profile (readable only by you);
+- on `start` from claude-for-zen switches remote control on (port **9222**, the only port Firefox uses for this; the session shares your cookies like the command-line flag does), and switches it off again as soon as claude-for-zen disconnects;
+- does nothing else: it exposes no API to web pages or other add-ons.
+
+So remote control is on only while Claude is using Zen, and `navigator.webdriver` is never visible to sites. It shows up in `about:addons` as "Claude for Zen"; disable or remove it there.
+
+Zen's defaults only run add-ons signed by Mozilla and without experiment APIs, and Mozilla doesn't sign experiments for third parties. `--no-restart` therefore also sets `xpinstall.signatures.required = false` and `extensions.experiments.enabled = true` in your profile (Zen is built so that these prefs apply; Firefox release builds ignore them, which is why this mode is Zen-only). The trade-off: Zen will then also accept other unsigned add-ons, so only install add-ons from sources you trust. Add-ons from addons.mozilla.org are unaffected.
 
 ### What everyday mode changes in your profile
 
@@ -161,6 +180,7 @@ Zen is started with `-profile <your profile> --remote-debugging-port 9333`; on m
 - Browser UI outside the page (address bar, extension popups, permission prompts, native file pickers, the downloads panel) is not visible in screenshots and can't be clicked. The same is true for Claude in Chrome.
 - `find` matches roles, labels, text and attributes heuristically. Claude in Chrome uses a model for this.
 - One Claude Code session per Zen instance at a time (see Troubleshooting).
+- The helper add-on needs Zen (or another Firefox build without enforced signing); with Firefox release, everyday mode falls back to restarting the browser once. While the add-on has remote control on, port 9222 must be free (Chrome's remote debugging often uses it).
 - Zen's remote agent can't open windows itself (it only does that for Firefox), so claude-for-zen opens Claude's window the way you would: it Shift+clicks a link in a short-lived background tab of yours, which you may see flash in the sidebar. Closing Claude's window together with its last tab uses Zen's AppleScript support and works on macOS; elsewhere the window stays open with Zen's empty tab.
 - The automatic restart is macOS-only, where the standard Quit event makes Zen save its session. On Linux, Firefox-based browsers exit on SIGTERM without saving it, and Windows has no clean per-process quit, so there Claude asks you to quit Zen and then opens it with your profile.
 - CAPTCHAs are not solved, by design.
@@ -175,7 +195,7 @@ E2E_PROFILE_MODE=existing npm run test:e2e     # run the tool suite in everyday-
 ZEN_BINARY=$(which firefox) npm run test:e2e   # against Firefox
 ```
 
-The e2e suites drive the real MCP server over stdio, exactly as Claude Code does. `tools.test.js` exercises every tool against a fixture site: trusted clicks, modifier and multi-clicks, drag, unicode typing, React-style controlled inputs, cross-origin iframes, dialogs, popups, uploads, GIFs, stale refs and recovery after the browser is killed. `existing.test.js` plays the everyday-profile flow on a throwaway profile: a normally started browser, the permission prompt, the restart with session restore (macOS) or reopening after the user quits (Linux), Claude's tabs in a window of their own that Zen keeps unsynced from the user's, and the browser left running afterwards. CI runs both against headless Firefox on Linux.
+The e2e suites drive the real MCP server over stdio, exactly as Claude Code does. `tools.test.js` exercises every tool against a fixture site: trusted clicks, modifier and multi-clicks, drag, unicode typing, React-style controlled inputs, cross-origin iframes, dialogs, popups, uploads, GIFs, stale refs and recovery after the browser is killed. `existing.test.js` plays the everyday-profile flow on a throwaway profile: a normally started browser, the permission prompt, the restart with session restore (macOS) or reopening after the user quits (Linux), Claude's tabs in a window of their own that Zen keeps unsynced from the user's, and the browser left running afterwards. `addon.test.js` (Zen only) starts Zen without the flag, checks that the add-on switches remote control on without a restart, off when Claude disconnects, and that Zen is opened without the flag when it isn't running. CI runs the first two against headless Firefox on Linux.
 
 Project layout:
 
@@ -192,7 +212,8 @@ src/bidi.js             WebDriver BiDi client
 
 `claude-for-zen` membuat Claude Code bisa mengendalikan Zen Browser seperti Claude in Chrome mengendalikan Chrome: membuka tab, membaca halaman, klik, mengetik, mengisi form, menjalankan JavaScript, membaca console/network, menangani dialog, upload file, dan merekam GIF.
 
-- **Pakai Zen harian Anda** (disarankan kalau ingin seperti Claude in Chrome): `node bin/claude-for-zen.js install --existing-profile`. Claude membuka **jendela Zen sendiri dengan profil Anda**, jadi login tetap ada, dan tab Anda tidak tercampur. Jendela itu muncul di depan dan tertutup otomatis saat Claude menutup tab terakhirnya (macOS). Kalau Zen sedang terbuka tanpa remote control, Claude akan **minta izin dulu** untuk me-restart Zen sekali; semua jendela dan tab kembali seperti biasa (macOS; di Linux/Windows Claude meminta Anda menutup Zen, lalu membukanya lagi). Bisa juga tutup Zen lalu buka dengan `node bin/claude-for-zen.js launch`.
+- **Pakai Zen harian Anda tanpa pernah restart** (disarankan): `node bin/claude-for-zen.js install --no-restart`. Ini memasang add-on kecil "Claude for Zen" yang menyalakan remote control hanya saat Claude bekerja, lalu mematikannya lagi. Zen tidak pernah di-restart. Saat Zen dibuka berikutnya, pilih **Enable** ketika muncul pemberitahuan add-on baru. Konsekuensinya: Zen jadi menerima add-on tanpa tanda tangan Mozilla, jadi pasang add-on lain hanya dari sumber tepercaya.
+- **Pakai Zen harian Anda tanpa add-on**: `node bin/claude-for-zen.js install --existing-profile`. Claude membuka **jendela Zen sendiri dengan profil Anda**, jadi login tetap ada, dan tab Anda tidak tercampur. Jendela itu muncul di depan dan tertutup otomatis saat Claude menutup tab terakhirnya (macOS). Kalau Zen sedang terbuka tanpa remote control, Claude akan **minta izin dulu** untuk me-restart Zen sekali; semua jendela dan tab kembali seperti biasa (macOS; di Linux/Windows Claude meminta Anda menutup Zen, lalu membukanya lagi). Bisa juga tutup Zen lalu buka dengan `node bin/claude-for-zen.js launch`.
 - **Profil terpisah untuk Claude**: `node bin/claude-for-zen.js install`. Claude memakai jendela Zen sendiri; login sekali lewat `node bin/claude-for-zen.js launch`.
 
 ## License

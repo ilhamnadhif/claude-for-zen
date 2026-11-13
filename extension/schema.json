@@ -1,0 +1,7 @@
+[
+  {
+    "namespace": "claudeForZen",
+    "description": "No API is exposed to web pages or extension pages; the add-on only runs the control server in the parent process.",
+    "functions": []
+  }
+]

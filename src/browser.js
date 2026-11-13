@@ -2,7 +2,7 @@
 // primitives the MCP tools are built from.
 
 import { BidiClient, BidiError, BidiTimeoutError } from "./bidi.js";
-import { endpointUrl, defaultHome } from "./config.js";
+import { defaultHome } from "./config.js";
 import {
   launchBrowser,
   isPortOpen,
@@ -22,6 +22,16 @@ import {
 } from "./launcher.js";
 import { installRuntime } from "./page/runtime.js";
 import { KEY } from "./keys.js";
+import {
+  ADDON_VERSION,
+  addonInfo,
+  addonState,
+  buildXpi,
+  compareVersions,
+  connectControl,
+  sideloadAddon,
+  waitForAddonState,
+} from "./addon.js";
 import { decodePng, encodeJpeg, fitScale, resize, MAX_EDGE, MAX_PIXELS } from "./image.js";
 import { formatException } from "./remote-value.js";
 
@@ -120,6 +130,9 @@ export class ZenBrowser {
     this.launched = null;
     this.capabilities = null;
     this.restarted = false; // the user's Zen was restarted to enable remote debugging
+    this.port = config.port; // the BiDi port actually in use
+    this.control = null; // control connection to the helper add-on (keeps remote control on)
+    this.profileDir = null; // everyday profile in use
     this._reset();
   }
 
@@ -189,7 +202,8 @@ export class ZenBrowser {
 
   async _connect(opts = {}) {
     const { config } = this;
-    const url = endpointUrl(config);
+    this.port = config.port;
+    this._closeControl();
 
     if (!config.connectOnly) {
       if (this.existingProfile) {
@@ -200,10 +214,13 @@ export class ZenBrowser {
       }
     }
 
+    // The helper add-on may have switched remote control on at its own port.
+    const url = config.bidiUrl || `ws://${config.host}:${this.port}/session`;
     const client = new BidiClient(url, { commandTimeoutMs: config.commandTimeoutMs, log: this.log });
     try {
       await client.connect(5000);
     } catch (e) {
+      this._closeControl();
       if (config.connectOnly) {
         throw new UserError(
           `Could not connect to Zen at ${url} (${e.message}). Start Zen with remote debugging enabled, e.g.\n` +
@@ -256,6 +273,7 @@ export class ZenBrowser {
 
     client.on("event", (msg) => this._onEvent(msg));
     client.on("close", () => {
+      this._closeControl();
       this.log("browser connection closed");
       this.sessionId = null;
     });
@@ -272,6 +290,7 @@ export class ZenBrowser {
     }
 
     await this.refreshTree();
+    if (this.existingProfile) this._ensureAddon().catch((e) => this.log(`helper add-on check failed: ${e.message}`));
 
     if (config.hideWebdriver) {
       await Promise.all(
@@ -326,6 +345,7 @@ export class ZenBrowser {
       throw new UserError(e.message);
     }
 
+    this.profileDir = profileDir;
     let owner = findProfileOwner(profileDir);
     if (await isPortOpen(config.host, config.port)) {
       const listener = findPortListener(config.port);
@@ -347,12 +367,27 @@ export class ZenBrowser {
     }
 
     if (!owner) {
+      const info = addonInfo(profileDir);
+      if (config.helperAddon && info?.active) {
+        // Start Zen exactly as from the Dock; the helper add-on switches remote control on.
+        this.launched = await launchBrowser(config, this.log, { profileDir, existing: true, remoteDebugging: false });
+        this.log(`opened your Zen profile (pid ${this.launched.pid ?? "?"}); waiting for the helper add-on`);
+        const state = await waitForAddonState(profileDir, this.launched.pid, config.launchTimeoutMs);
+        if (state && (await this._startViaAddon(profileDir, { pid: this.launched.pid }))) return;
+        throw new UserError(
+          'Zen opened, but its "Claude for Zen" add-on did not answer, so remote control is still off. ' +
+            "Ask the user to check that the add-on is enabled in Zen (about:addons).",
+        );
+      }
       this.launched = await launchBrowser(config, this.log, { profileDir, existing: true });
       this.log(`opened your Zen profile (pid ${this.launched.pid ?? "?"})`);
       return;
     }
 
-    // Zen is open without remote debugging, which can only be enabled at startup.
+    // Zen is open without remote control: the helper add-on can switch it on.
+    if (await this._startViaAddon(profileDir, owner)) return;
+
+    // Otherwise remote debugging can only be enabled at startup.
     const policy = allowRestart ? "auto" : config.restart;
     const comesBack = restoresTabs(profileDir, binary)
       ? "all windows and tabs come back automatically (as when the user quits and reopens Zen), but anything typed into a page and not yet saved may be lost"
@@ -393,6 +428,78 @@ export class ZenBrowser {
     this.log(`restarted Zen (pid ${this.launched.pid ?? "?"})`);
   }
 
+  /**
+   * Ask the helper add-on of the running Zen to switch remote control on.
+   * Keeps the control connection open: closing it switches remote control off.
+   */
+  async _startViaAddon(profileDir, owner) {
+    const state = addonState(profileDir);
+    if (!state) return false;
+    if (owner?.pid && state.pid && state.pid !== owner.pid) return false; // left over from an earlier run
+    let control;
+    try {
+      control = await connectControl(state);
+    } catch (e) {
+      this.log(`helper add-on not reachable: ${e.message}`);
+      return false;
+    }
+    let port;
+    try {
+      port = await control.start();
+    } catch (e) {
+      control.close();
+      throw new UserError(`Zen's "Claude for Zen" add-on could not switch remote control on: ${e.message}`);
+    }
+    const listener = findPortListener(port);
+    if (listener && owner?.pid && listener !== owner.pid) {
+      control.close();
+      const cmd = processCommand(listener);
+      throw new UserError(
+        `Zen's remote control uses port ${port}, but another program is listening there (pid ${listener}${cmd ? `: ${cmd.slice(0, 120)}` : ""}). ` +
+          "Ask the user to close it (Chrome's remote debugging often uses this port).",
+      );
+    }
+    this.control = control;
+    this.port = port;
+    this.log(`remote control switched on by the helper add-on (port ${port})`);
+    return true;
+  }
+
+  _closeControl() {
+    if (this.control) {
+      this.control.close();
+      this.control = null;
+    }
+  }
+
+  /**
+   * Make sure the helper add-on is in the user's profile (ZEN_HELPER_ADDON=1):
+   * install it right away when Zen accepts it, otherwise drop it into the
+   * profile so Zen offers it at its next start.
+   */
+  async _ensureAddon() {
+    if (!this.config.helperAddon || !this.profileDir || this._addonChecked) return;
+    this._addonChecked = true;
+    const info = addonInfo(this.profileDir);
+    if (info && compareVersions(info.version, ADDON_VERSION) >= 0) return;
+    try {
+      await this.client.send(
+        "webExtension.install",
+        { extensionData: { type: "base64", value: buildXpi().toString("base64") }, "moz:permanent": true },
+        { timeoutMs: 30000 },
+      );
+      this.log("installed the helper add-on");
+      return;
+    } catch (e) {
+      this.log(`helper add-on not installed now (${e.message}); it will be offered at Zen's next start`);
+    }
+    try {
+      sideloadAddon(this.profileDir);
+    } catch (e) {
+      this.log(`could not copy the helper add-on into the profile: ${e.message}`);
+    }
+  }
+
   async send(method, params, opts) {
     await this.ensure();
     try {
@@ -411,6 +518,8 @@ export class ZenBrowser {
       } catch {}
       client.close();
     }
+    // Lets the helper add-on switch remote control off again.
+    this._closeControl();
     // Never quit the user's everyday browser.
     if (this.config.killOnExit && this.launched?.pid && this.config.profileMode !== "existing") {
       try {
@@ -717,7 +826,7 @@ export class ZenBrowser {
     try {
       await this.send("browsingContext.activate", { context: ctx });
     } catch {}
-    if (!this.config.headless) activateMacApp(findPortListener(this.config.port));
+    if (!this.config.headless) activateMacApp(findPortListener(this.port));
     return ctx;
   }
 

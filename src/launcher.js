@@ -47,6 +47,21 @@ export const EXISTING_PROFILE_PREFS = {
   "dom.file.createInChild": true,
 };
 
+// Added with ZEN_HELPER_ADDON=1 (opt-in). Zen's own defaults refuse unsigned
+// add-ons and add-ons with experiment APIs; the helper add-on (extension/) is
+// both, because only privileged code can switch the remote agent on at
+// runtime. Zen is built without MOZ_REQUIRE_SIGNING, so these prefs apply.
+export const HELPER_ADDON_PREFS = {
+  "xpinstall.signatures.required": false,
+  "extensions.experiments.enabled": true,
+  "remote.experimental.dynamicstart.enabled": true,
+};
+
+/** The managed prefs for the user's everyday profile under this config. */
+export function existingProfilePrefs(config) {
+  return config.helperAddon ? { ...EXISTING_PROFILE_PREFS, ...HELPER_ADDON_PREFS } : EXISTING_PROFILE_PREFS;
+}
+
 function isExecutable(p) {
   try {
     fs.accessSync(p, fs.constants.X_OK);
@@ -494,9 +509,13 @@ function macBundle(binary) {
  * `oneShotPrefs` are applied for this start only.
  * @returns {Promise<{pid: number|null, binary: string}>}
  */
-export async function launchBrowser(config, log = () => {}, { profileDir = config.profileDir, existing = false, oneShotPrefs = null } = {}) {
+export async function launchBrowser(
+  config,
+  log = () => {},
+  { profileDir = config.profileDir, existing = false, oneShotPrefs = null, remoteDebugging = true } = {},
+) {
   const binary = findBinary(config);
-  const prefs = existing ? EXISTING_PROFILE_PREFS : MANAGED_PREFS;
+  const prefs = existing ? existingProfilePrefs(config) : MANAGED_PREFS;
   if (existing) {
     if (findProfileOwner(profileDir)) throw new Error(`The profile ${profileDir} is already open in Zen.`);
     prepareProfile(profileDir, { ...prefs, ...(oneShotPrefs || {}) }, { create: false });
@@ -514,7 +533,8 @@ export async function launchBrowser(config, log = () => {}, { profileDir = confi
 
   const args = ["-profile", profileDir];
   if (!existing) args.push("-no-remote");
-  args.push("--remote-debugging-port", String(config.port));
+  // Without the flag (helper add-on mode) Zen starts exactly as from the Dock.
+  if (remoteDebugging) args.push("--remote-debugging-port", String(config.port));
   if (config.headless) args.push("-headless");
   args.push(...config.extraArgs);
 
@@ -545,7 +565,10 @@ export async function launchBrowser(config, log = () => {}, { profileDir = confi
   try {
     const deadline = Date.now() + config.launchTimeoutMs;
     while (Date.now() < deadline) {
-      if (await isPortOpen(config.host, config.port)) {
+      if (!remoteDebugging) {
+        const owner = findProfileOwner(profileDir);
+        if (owner) return { pid: owner.pid ?? pid, binary };
+      } else if (await isPortOpen(config.host, config.port)) {
         if (existing) pid = findProfileOwner(profileDir)?.pid ?? pid;
         return { pid, binary };
       }
@@ -557,8 +580,10 @@ export async function launchBrowser(config, log = () => {}, { profileDir = confi
       await sleep(250);
     }
     throw new Error(
-      `Zen did not open its remote debugging port ${config.port} within ${Math.round(config.launchTimeoutMs / 1000)}s. ` +
-        `Is another program using that port? Set ZEN_BIDI_PORT to change it.`,
+      remoteDebugging
+        ? `Zen did not open its remote debugging port ${config.port} within ${Math.round(config.launchTimeoutMs / 1000)}s. ` +
+            `Is another program using that port? Set ZEN_BIDI_PORT to change it.`
+        : `Zen did not start within ${Math.round(config.launchTimeoutMs / 1000)}s.`,
     );
   } finally {
     // Zen has read user.js by the time the port opens (or gave up); drop one-shot prefs.
